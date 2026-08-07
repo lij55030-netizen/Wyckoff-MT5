@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
             # 关闭状态：恢复默认样式（默认隐藏，不加载任何光标状态）
             self._crosshair_btn.setText("➕ 十字光标")
             self._crosshair_btn.setStyleSheet("")
-        self._kline_status.setText(f"十字光标: {'已开启' if checked else '已关闭'}")
+        # 注意：状态栏提示由 1 秒倒计时定时器持续刷新，此处不写状态栏避免被覆盖
 
     # ── 实时价格标注：后台轮询 MT5 tick，更新图表红线 ─────────────────────
     def _poll_tick(self) -> None:

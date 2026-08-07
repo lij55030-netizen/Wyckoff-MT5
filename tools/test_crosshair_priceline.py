@@ -40,18 +40,32 @@ chk("默认隐藏: 价格线",
    not chart._last_price_line.isVisible() and not chart._last_price_label.isVisible())
 chk("默认关闭: crosshair_enabled=False", not chart.is_crosshair_enabled())
 
-# 2. 启用十字线 → 模拟鼠标移动到图表内（吸附 bars[5]，vx = 100-1-5 = 94）
+# 2. 启用十字线 → 模拟鼠标移动到图表内任意位置（吸附 bars[5]，vx = 100-1-5 = 94）
 chart.set_crosshair_enabled(True)
 target_idx = 5
-vx = 100 - 1 - target_idx
-scene_pos = vb.mapViewToScene(pg.QtCore.QPointF(vx, bars[target_idx].close))
+mouse_view_x = 100 - 1 - target_idx + 0.3   # 鼠标不在K线正中心（测试吸附）
+mouse_view_y = bars[target_idx].close + 55.5  # 鼠标y远离收盘价（测试水平线跟随鼠标）
+scene_pos = vb.mapViewToScene(pg.QtCore.QPointF(mouse_view_x, mouse_view_y))
 chart._on_scene_mouse_moved(scene_pos)
 app.processEvents()
 chk("激活后: 十字线可见",
    chart._ch_vline.isVisible() and chart._ch_hline.isVisible() and chart._ch_label.isVisible())
 chk("吸附索引正确 (bars[5])", chart._cross_idx == target_idx)
-chk("水平线吸附收盘价", abs(chart._ch_hline.value() - bars[5].close) < 1e-9)
-chk("垂直线吸附K线中心", abs(chart._ch_vline.value() - vx) < 1e-9)
+chk("垂直线吸附K线中心",
+   abs(chart._ch_vline.value() - (100 - 1 - target_idx)) < 1e-9)
+chk("水平线跟随鼠标y对齐",
+   abs(chart._ch_hline.value() - mouse_view_y) < 1e-9)
+
+# 像素级对齐验证：十字线映射回场景坐标与鼠标场景坐标对比
+v_line_scene_x = vb.mapViewToScene(pg.QtCore.QPointF(chart._ch_vline.value(), 0)).x()
+h_line_scene_y = vb.mapViewToScene(pg.QtCore.QPointF(0, chart._ch_hline.value())).y()
+dx_px = abs(v_line_scene_x - scene_pos.x())   # 垂直线吸附偏差（应≤半格）
+dy_px = abs(h_line_scene_y - scene_pos.y())   # 水平线偏差（应≈0）
+half_bar_px = abs(vb.mapViewToScene(pg.QtCore.QPointF(0, 0)).x()
+                  - vb.mapViewToScene(pg.QtCore.QPointF(0.5, 0)).x())
+chk(f"像素对齐: 水平线偏差 {dy_px:.2f}px (≈0)", dy_px < 1.0)
+chk(f"像素对齐: 垂直线偏差 {dx_px:.2f}px (≤半格 {half_bar_px:.2f}px)", dx_px <= half_bar_px + 1.0)
+
 label_txt = chart._ch_label.toPlainText()
 chk("标签含OHLC+时间", "开" in label_txt and "收" in label_txt and "-" in label_txt)
 print("   标签内容:", label_txt.replace(chr(10), " | "))

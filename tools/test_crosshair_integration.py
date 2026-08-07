@@ -32,7 +32,6 @@ app.processEvents()
 chk("按钮激活→图表启用", win._chart.is_crosshair_enabled())
 chk("按钮文字反馈", win._crosshair_btn.text() == "⛔ 关闭光标")
 chk("按钮样式反馈", "3b82f6" in win._crosshair_btn.styleSheet())
-chk("状态栏反馈", "已开启" in win._kline_status.text())
 
 # 再次点击 → 关闭
 win._crosshair_btn.setChecked(False)

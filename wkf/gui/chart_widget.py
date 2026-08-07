@@ -315,8 +315,10 @@ class WkfChart(QWidget):
             self._cross_idx = -1
             self._in_chart_area = False
         elif self._frame is not None and self._mouse_scene_pos is not None:
-            # 激活：若鼠标已在图表区域，立即用当前位置显示
-            self._update_crosshair(self._mouse_scene_pos)
+            # 激活：仅当鼠标当前位于图表区域内才立即显示，避免鼠标在图外时十字线跳至远处
+            vb = self._plot.getPlotItem().vb
+            if vb.sceneBoundingRect().contains(self._mouse_scene_pos):
+                self._update_crosshair(self._mouse_scene_pos)
 
     def is_crosshair_enabled(self) -> bool:
         return self._crosshair_enabled
@@ -366,21 +368,24 @@ class WkfChart(QWidget):
         bar = self._frame.bars[idx]
         self._cross_idx = idx
 
-        # 十字线定位：x 吸附到该K线中心，y 吸附到该K线收盘价
+        # 十字线定位：
+        #  - 垂直 x 方向：吸附到最近K线中心（snap，标签显示该K线精确 OHLC+时间戳）
+        #  - 水平 y 方向：跟随鼠标当前价格坐标（保证十字线交点实时与鼠标对齐）
         x_center = len(self._frame.bars) - 1 - idx
+        mouse_y = vp.y()
         self._ch_vline.setPos(x_center)
-        self._ch_hline.setPos(bar.close)
+        self._ch_hline.setPos(mouse_y)
         self._ch_vline.setVisible(True)
         self._ch_hline.setVisible(True)
         if CROSSHAIR_CFG["rsi_sync"]:
             self._ch_rsi_vline.setPos(x_center)
             self._ch_rsi_vline.setVisible(True)
 
-        # 数值标签：默认放在十字线右上方；靠近右边界时翻转到左侧避免出界
+        # 数值标签：跟随交点位置（x=K线中心, y=鼠标价格），默认右上方；靠近右边界时翻转
         if CROSSHAIR_CFG["label_visible"]:
             xr = vb.viewRange()[0]
             flip = x_center > (xr[0] + xr[1]) / 2
-            self._ch_label.setPos(x_center, bar.close)
+            self._ch_label.setPos(x_center, mouse_y)
             self._ch_label.setAnchor((1, 0) if flip else (0, 1))
             self._ch_label.setText(self._format_crosshair_label(bar))
             self._ch_label.setVisible(True)
