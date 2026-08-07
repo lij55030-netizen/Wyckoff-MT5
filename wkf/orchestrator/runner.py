@@ -83,8 +83,16 @@ def run_analysis(
             res.error = "MT5 返回空 K 线数据"
             return res
 
-        # 2. 指标
-        ind = compute_indicators(bars)
+        # 2. 指标（参数来自设置，可配置）
+        ind_cfg = settings.indicators
+        ind = compute_indicators(
+            bars,
+            rsi_period=ind_cfg.rsi_period,
+            bollinger_period=ind_cfg.bollinger_period,
+            bollinger_std=ind_cfg.bollinger_std,
+            ema_period=ind_cfg.ema_period,
+            atr_period=ind_cfg.atr_period,
+        )
         res.steps.append("指标计算(EMA/ATR/RSI/BB/VWAP)")
 
         frame = KlineFrame(
@@ -94,11 +102,16 @@ def run_analysis(
             indicators=ind,
         )
         # 3. 订单流
-        frame = enrich_frame_with_orderflow(frame)
+        frame = enrich_frame_with_orderflow(frame, va_pct=ind_cfg.value_area_pct)
         res.steps.append("订单流增强(Delta/POC/VA/足迹)")
 
         # 4. 威科夫三层
-        wa = analyze(frame)
+        wa = analyze(
+            frame,
+            va_pct=ind_cfg.value_area_pct,
+            swing_window=ind_cfg.swing_window,
+            footprint_threshold=ind_cfg.footprint_threshold,
+        )
         res.wyckoff = wa
         res.steps.append("威科夫三层分析(背景/价值区域/订单流验证)")
 

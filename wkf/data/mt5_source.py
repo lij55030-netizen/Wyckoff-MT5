@@ -103,8 +103,16 @@ def fetch_mt5_bars(
     return bars
 
 
-def compute_indicators(bars: list[KlineBar]) -> IndicatorBundle:
-    """计算 EMA20/ATR14/RSI14/布林带/VWAP。"""
+def compute_indicators(
+    bars: list[KlineBar],
+    *,
+    rsi_period: int = 14,
+    bollinger_period: int = 20,
+    bollinger_std: float = 2.0,
+    ema_period: int = 20,
+    atr_period: int = 14,
+) -> IndicatorBundle:
+    """计算 EMA/ATR/RSI/布林带/VWAP（周期可配置）。"""
     n = len(bars)
     if n == 0:
         return IndicatorBundle()
@@ -114,10 +122,10 @@ def compute_indicators(bars: list[KlineBar]) -> IndicatorBundle:
     lows = [b.low for b in bars]
     volumes = [b.volume for b in bars]
 
-    ema = ema_full(closes, 20)
-    atr = atr_full(highs, lows, closes, 14)
-    rsi = rsi_full(closes, 14)
-    bb_u, bb_m, bb_l = bollinger_full(closes, 20, 2.0)
+    ema = ema_full(closes, ema_period)
+    atr = atr_full(highs, lows, closes, atr_period)
+    rsi = rsi_full(closes, rsi_period)
+    bb_u, bb_m, bb_l = bollinger_full(closes, bollinger_period, bollinger_std)
     vwap = vwap_full(highs, lows, closes, volumes)
 
     return IndicatorBundle(

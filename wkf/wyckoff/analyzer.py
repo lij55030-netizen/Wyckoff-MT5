@@ -138,7 +138,13 @@ _PHASE_ZH = {
 _BIAS_ZH = {"long": "偏多", "short": "偏空", "neutral": "中性观望"}
 
 
-def analyze(frame: KlineFrame, *, va_pct: float = 0.682) -> WyckoffAnalysis:
+def analyze(
+    frame: KlineFrame,
+    *,
+    va_pct: float = 0.682,
+    swing_window: int = 40,
+    footprint_threshold: float = 2.0,
+) -> WyckoffAnalysis:
     """三层威科夫综合分析。"""
     bars = frame.bars
     if not bars:
@@ -180,6 +186,7 @@ def analyze(frame: KlineFrame, *, va_pct: float = 0.682) -> WyckoffAnalysis:
                 cumulative_delta=cum,
                 footprint=fp0,
                 tick_size=tick_size,
+                thresholds=(footprint_threshold, footprint_threshold * 1.5, footprint_threshold * 2.0),
             )
         else:
             # 完全无足迹：仅按 delta 序列验证
@@ -188,6 +195,7 @@ def analyze(frame: KlineFrame, *, va_pct: float = 0.682) -> WyckoffAnalysis:
                 cumulative_delta=cum,
                 footprint=None,
                 tick_size=tick_size,
+                thresholds=(footprint_threshold, footprint_threshold * 1.5, footprint_threshold * 2.0),
             )
     else:
         # OHLCV 近似
@@ -203,6 +211,7 @@ def analyze(frame: KlineFrame, *, va_pct: float = 0.682) -> WyckoffAnalysis:
         closes,
         vah=va.vah if va else None,
         val=va.val if va else None,
+        swing_window=swing_window,
     )
 
     # ── 综合倾向 ─────────────────────────────────────────────────────────────

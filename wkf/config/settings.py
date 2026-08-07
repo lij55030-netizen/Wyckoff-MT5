@@ -32,6 +32,21 @@ class GeneralSettings(BaseModel):
     last_timeframe: str = "15m"
 
 
+class IndicatorSettings(BaseModel):
+    """分析指标参数（用户可在「其他设置」菜单调整）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    rsi_period: int = 14
+    bollinger_period: int = 20
+    bollinger_std: float = 2.0
+    ema_period: int = 20
+    atr_period: int = 14
+    value_area_pct: float = 0.682  # 威科夫价值区域占比（±1σ）
+    footprint_threshold: float = 2.0  # 足迹图失衡最低倍数
+    swing_window: int = 40  # 背景判定摆动窗口
+
+
 class FeishuSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -47,12 +62,13 @@ class Settings(BaseModel):
 
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     general: GeneralSettings = Field(default_factory=GeneralSettings)
+    indicators: IndicatorSettings = Field(default_factory=IndicatorSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
 
 
-def load_settings(path: Path | None = None) -> Settings:
+def load_settings(path: Path | str | None = None) -> Settings:
     """加载 settings.json，并用 config.ini 覆盖（config.ini 优先级更高）。"""
-    p = path or SETTINGS_JSON_PATH
+    p = Path(path) if path else SETTINGS_JSON_PATH
     if not p.exists():
         settings = Settings()
     else:
@@ -128,8 +144,8 @@ def _parse_config_ini(ini: Path) -> dict[str, str]:
     return result
 
 
-def save_settings(settings: Settings, path: Path | None = None) -> None:
-    p = path or SETTINGS_JSON_PATH
+def save_settings(settings: Settings, path: Path | str | None = None) -> None:
+    p = Path(path) if path else SETTINGS_JSON_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
         json.dumps(settings.model_dump(), ensure_ascii=False, indent=2),
