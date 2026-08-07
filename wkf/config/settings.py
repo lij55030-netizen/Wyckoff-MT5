@@ -30,6 +30,10 @@ class GeneralSettings(BaseModel):
     analysis_bar_count: int = 48  # 图表默认时间级别 = 48小时窗口；此为根数下限
     last_symbol: str = "NQ1!"
     last_timeframe: str = "15m"
+    # K线明细表格渲染样式: "new"=表格UI(默认) / "old"=旧版纯文本(一键回滚)
+    table_style: str = "new"
+    # 首次启动标志：用于启动时弹窗引导基础配置（AI Key / 飞书 Webhook）
+    first_run: bool = True
 
 
 class IndicatorSettings(BaseModel):
@@ -55,6 +59,12 @@ class FeishuSettings(BaseModel):
     secret: str = ""
     app_id: str = ""
     app_secret: str = ""
+    # 分析完成推送开关（仅行情分析完成触发，软件闲置不发消息）
+    notify_enabled: bool = True
+    # 同品种推送防抖分钟数（默认 3 分钟，避免重复推送）
+    push_dedup_minutes: int = 3
+    # 行情概率达到该阈值时，核心字段使用红色加粗推送（%）
+    push_prob_threshold: float = 66.5
 
 
 class Settings(BaseModel):

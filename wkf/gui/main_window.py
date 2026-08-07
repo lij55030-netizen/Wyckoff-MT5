@@ -91,8 +91,28 @@ class _KlineTableWidget(QWidget):
             self.table.setColumnWidth(i, w)
         layout.addWidget(self.table)
 
+        # 旧版纯文本视图（默认隐藏）：「其他设置」表格样式一键回滚开关使用
+        self._text_view = QPlainTextEdit()
+        self._text_view.setReadOnly(True)
+        self._text_view.setMaximumBlockCount(2000)
+        self._text_view.hide()
+        layout.addWidget(self._text_view)
+
+    def set_plain_mode(self, plain: bool, text: str = "") -> None:
+        """表格渲染模式切换：plain=True 显示旧版纯文本表格，False 显示新版 QTableWidget。"""
+        if plain:
+            if text:
+                self._text_view.setPlainText(text)
+            self._text_view.show()
+            self.table.hide()
+        else:
+            self._text_view.hide()
+            self.table.show()
+
     def toPlainText(self) -> str:
-        """兼容方法：返回表格文本（供测试/外部读取，保持原文本表格语义）。"""
+        """兼容方法：返回当前可见模式下的文本（供测试/外部读取）。"""
+        if self._text_view.isVisible():
+            return self._text_view.toPlainText()
         lines = [self.status_label.text()]
         lines.append("序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 涨跌 | 成交量 | RSI | VWAP | Δ")
         for r in range(self.table.rowCount()):
@@ -348,6 +368,7 @@ class MainWindow(QMainWindow):
         self._analysis_busy = False
         self._history_count = 0
         self._has_ai_result = False
+        self._analysis_time = ""  # 本次分析时间（年月日时分秒），决策面板/历史/飞书统一使用
         # 问AI对话状态
         self._ai_busy = False
         self._ai_reply.connect(self._on_ai_reply)
@@ -378,6 +399,62 @@ class MainWindow(QMainWindow):
 
         # 启动后立即拉一次数据 + 状态
         self._on_fetch_data()
+        # 首次启动引导：自动创建目录 + 弹窗引导基础配置（AI Key / 飞书 Webhook）
+        self._first_run_setup()
+
+    def _first_run_setup(self) -> None:
+        """首次启动：自动创建所需文件夹（output 报告/推送日志等）；弹窗引导基础配置。
+
+        引导完成后清除 first_run 标记，下次启动不再弹窗。
+        """
+        try:
+            from wkf.config.settings import SETTINGS_JSON_PATH, save_settings
+
+            out_dir = SETTINGS_JSON_PATH.parent.parent / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)  # 分析报告 / push_log.txt 输出目录
+        except Exception:
+            pass
+
+        if not getattr(self._settings.general, "first_run", False):
+            return
+        # 清除首次运行标记并落盘
+        try:
+            self._settings.general.first_run = False
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+        except Exception:
+            pass
+
+        missing: list[str] = []
+        if not (self._settings.provider.api_key or "").strip():
+            missing.append("🤖 AI 模型 API Key")
+        if self._settings.feishu.notify_enabled and not (self._settings.feishu.webhook_url or "").strip():
+            missing.append("📮 飞书 Webhook 地址")
+        if missing:
+            QTimer.singleShot(1200, lambda: self._show_first_run_guide(missing))
+
+    def _show_first_run_guide(self, missing: list) -> None:
+        """首次启动引导弹窗：询问是否打开设置面板（不阻塞崩溃，可稍后配置）。"""
+        if not self.isVisible():
+            return
+        from PyQt6.QtWidgets import QMessageBox
+
+        ret = QMessageBox.question(
+            self,
+            "WKF 首次使用引导",
+            "欢迎使用 WKF 威科夫交易智能体！\n\n"
+            "检测到以下基础配置尚未完成：\n"
+            + "\n".join(f"  · {m}" for m in missing)
+            + "\n\n是否现在打开设置面板进行配置？\n"
+            "（未配置 AI Key 将自动切换纯规则模式，飞书推送将暂停）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        joined = "".join(missing)
+        if "AI" in joined:
+            self._open_ai_dialog()
+        elif "飞书" in joined:
+            self._open_feishu_dialog()
 
     def closeEvent(self, event) -> None:
         """关闭窗口：停止定时器与后台线程，避免进程残留。"""
@@ -456,13 +533,16 @@ class MainWindow(QMainWindow):
         self._data_table.setRowCount(0)
         self._debounce_timer.start()
 
-    def _append_history(self, symbol: str, timeframe: str, bias: str, report: str) -> None:
-        """把一次分析结果加入历史记录面板（方向文案汉化：long→多头等）。"""
-        import datetime
+    def _append_history(self, symbol: str, timeframe: str, bias: str, report: str,
+                        time_str: str | None = None) -> None:
+        """把一次分析结果加入历史记录面板（方向文案汉化：long→多头等）。
 
+        time_str: 本次分析时间（年月日时分秒），与决策面板/飞书推送统一；
+        未传则取当前时间。
+        """
         bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(bias, bias)
         self._history_count += 1
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        ts = time_str or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{self._history_count}] {ts} {symbol} {timeframe}"
         if bias_zh:
             line += f" → {bias_zh}"
@@ -584,11 +664,51 @@ class MainWindow(QMainWindow):
         self._last_frame = res.frame
         self._last_wa = res.wyckoff
         self._last_res = res
+        # 本次分析时间（本地时间，年月日时分秒）：决策面板/历史记录/飞书推送统一使用
+        self._analysis_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 填充 5 个标签页
         self._populate_tabs(res.frame, res.wyckoff, res)
-        # 历史记录
+        # 历史记录（使用同一分析时间戳）
         bias = res.wyckoff.bias if res.wyckoff is not None else ""
-        self._append_history(res.symbol, res.timeframe, bias, res.to_report())
+        self._append_history(res.symbol, res.timeframe, bias, res.to_report(), self._analysis_time)
+        # 飞书推送：仅分析完成触发；防抖/高亮/日志均在 notifier 内处理（后台线程不阻塞 UI）
+        self._spawn_feishu_push(res, bias)
+
+    def _spawn_feishu_push(self, res: AnalysisResult, bias: str) -> None:
+        """分析完成后后台推送飞书（带分析时间/概率/三层结论）。"""
+        if res.wyckoff is None:
+            return
+        try:
+            from wkf.notify.feishu_notifier import push_analysis_notice
+
+            wa = res.wyckoff
+            prob = self._compute_probabilities(wa)
+            bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(wa.bias, wa.bias or "")
+            va = wa.value_area
+            of = wa.orderflow
+            va_text = f"价值区域：VA [{va.val:.2f}, {va.vah:.2f}] VPOC {va.vpoc:.2f}" if va else ""
+            of_text = (
+                f"订单流：Delta {of.delta:+.0f} 活跃方 {of.active_side} 阶段 {of.reversal_stage}"
+                if of else ""
+            )
+            symbol, timeframe = res.symbol, res.timeframe
+
+            def _work() -> None:
+                push_analysis_notice(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    analysis_time=self._analysis_time,
+                    prob=prob,
+                    bias_zh=bias_zh,
+                    price=wa.price,
+                    va_text=va_text,
+                    of_text=of_text,
+                    settings=self._settings,
+                )
+
+            threading.Thread(target=_work, name="wkf-feishu-push", daemon=True).start()
+        except Exception:
+            pass  # 推送失败不影响主流程
 
     # ── K线明细表格：UI 展示优化（仅前端渲染，不改任何数据/业务逻辑）─────
     def _set_table_status(self, text: str) -> None:
@@ -609,7 +729,6 @@ class MainWindow(QMainWindow):
             self._data_table.setRowCount(0)
             return
         ind = frame.indicators
-        of = frame.orderflow
         bars = frame.bars[:20]  # 与旧表格一致: 最近 20 根
         vols = [b.volume for b in bars]
         mean_vol = sum(vols) / len(vols) if vols else 0.0
@@ -621,7 +740,13 @@ class MainWindow(QMainWindow):
             ts = datetime.datetime.fromtimestamp(b.ts_open / 1000).strftime("%m-%d %H:%M")
             rsi = ind.rsi14[i] if i < len(ind.rsi14) and not math.isnan(ind.rsi14[i]) else None
             vwap = ind.vwap[i] if i < len(ind.vwap) and not math.isnan(ind.vwap[i]) else None
-            delta = of.delta[i] if of and i < len(of.delta) and not math.isnan(of.delta[i]) else None
+            # Δ 差值（修复长期空白/0 故障）：改为「当期收盘价 - 前一根收盘价」的价格差值，
+            # 表格首行（最新K线）不计算填横线；随行情刷新实时重算。
+            # bars 为新→旧排列，bars[i] 的前一根（时间更早）是 bars[i+1]。
+            if i == 0 or i + 1 >= len(bars):
+                delta = None
+            else:
+                delta = b.close - bars[i + 1].close
 
             # 涨跌图标（阳↑绿 / 阴↓红）
             trend_txt = "↑" if yang else "↓"
@@ -638,15 +763,15 @@ class MainWindow(QMainWindow):
                 rsi_icon = "🔵"
             else:
                 rsi_icon = "●"
-            # Δ 差值
+            # Δ 差值（价格差，2 位小数）：正数 ↑绿 / 负数 ↓红 / 0 或缺失 —灰
             if delta is None:
                 d_txt, d_color = "—", "#8b949e"
-            elif delta > 0:
-                d_txt, d_color = f"↑{int(delta):+d}", "#22c55e"
-            elif delta < 0:
-                d_txt, d_color = f"↓{int(delta):+d}", "#ef4444"
-            else:
+            elif abs(delta) < 0.005:
                 d_txt, d_color = "—", "#8b949e"
+            elif delta > 0:
+                d_txt, d_color = f"↑{delta:+.2f}", "#22c55e"
+            else:
+                d_txt, d_color = f"↓{delta:+.2f}", "#ef4444"
 
             vals = [
                 (str(b.seq), "#8b949e", False),            # 序号
@@ -689,7 +814,13 @@ class MainWindow(QMainWindow):
 
     # ── 标签页内容渲染 ────────────────────────────────────────────────────
     def _populate_tabs(self, frame, wa, res) -> None:
-        self._populate_data_table(frame)
+        # K线明细表格渲染样式：「其他设置」可切换新版表格UI / 旧版纯文本（一键回滚）
+        style = getattr(self._settings.general, "table_style", "new")
+        if style == "old":
+            self._tab_data.set_plain_mode(True, self._render_data_tab(frame))
+        else:
+            self._tab_data.set_plain_mode(False)
+            self._populate_data_table(frame)
         self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
         self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
         self._tab_decision.setHtml(self._render_decision_tab(wa))  # 富文本（红色粗体结论）
@@ -839,6 +970,13 @@ class MainWindow(QMainWindow):
 
         p = []
         p.append("<div style='font-size:13px;line-height:1.8'>")
+        # 本次分析时间（点击提交分析时的本地时间，重新分析自动刷新）
+        atime = getattr(self, "_analysis_time", "") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        p.append(
+            f"<p style='margin:0 0 8px;padding:6px 10px;background:#161d26;border-left:3px solid #f59e0b'>"
+            f"<b style='color:#f59e0b'>🕐 本次分析时间</b>"
+            f"　<span style='color:#e6edf3'>{atime}</span></p>"
+        )
         p.append("<p style='margin:2px 0 8px'><b style='color:#8b949e'>交易决策（基于当前盘面数据，严格写实）</b></p>")
 
         # ① 行情倾向 —— 核心结论：红色粗体
@@ -848,13 +986,17 @@ class MainWindow(QMainWindow):
             f"　<span style='color:#8b949e'>背景：{regime_zh}（HH+HL {bg.hh_hl_count} 组 / LH+LL {bg.lh_ll_count} 组）</span></p>"
         )
 
-        # ② 入场触发条件
+        # ② 入场触发条件（点位红色加粗高亮）
         p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>② 入场触发条件</b></p>")
-        p.append(f"<p style='margin:2px 0;color:#e6edf3'>{html.escape(wa.trigger)}</p>")
+        p.append(
+            f"<p style='margin:2px 0'><b><span style='color:#ef4444'>{html.escape(wa.trigger)}</span></b></p>"
+        )
 
-        # ③ 失效硬阈值
+        # ③ 失效硬阈值（风控点位红色加粗高亮）
         p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>③ 失效硬阈值</b></p>")
-        p.append(f"<p style='margin:2px 0;color:#e6edf3'>{html.escape(wa.invalidation)}</p>")
+        p.append(
+            f"<p style='margin:2px 0'><b><span style='color:#ef4444'>{html.escape(wa.invalidation)}</span></b></p>"
+        )
 
         # ④ 订单流结构
         p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>④ 订单流结构</b></p>")
@@ -1023,12 +1165,23 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_work, name="wkf-ai-chat", daemon=True).start()
 
     def _on_ai_reply(self, reply: str) -> None:
-        """AI 回复到达（主线程）：原地更新"思考中"占位为正式回复。"""
+        """AI 回复到达（主线程）：原地更新"思考中"占位为正式回复。
+
+        API Key 异常 / 调用失败时弹窗提示（不崩溃、不卡死 UI）。
+        """
         self._ai_busy = False
         self._tab_ai.send_btn.setEnabled(True)
+        is_error = reply.startswith("❌") or "未配置" in reply or "API" in reply and "失败" in reply
         self._tab_ai.update_last_ai(
             f"<span style='color:#e6edf3'>{html.escape(reply).replace(chr(10), '<br>')}</span>"
         )
+        if is_error:
+            from PyQt6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(
+                self, "AI 调用异常",
+                f"{reply}\n\n请在「⚙ 设置 → 🤖 AI 模型设置」中检查 API Key / 接口地址是否正确。",
+            )
 
     # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────
     def _on_auto_toggle(self, checked: bool) -> None:

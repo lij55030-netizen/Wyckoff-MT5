@@ -6,6 +6,7 @@ from typing import Callable
 
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -93,25 +94,42 @@ class FeishuDialog(_BaseDialog):
 
         self._enabled = QCheckBox("启用飞书通知")
         self._enabled.setChecked(f.enabled)
+        self._notify_enabled = QCheckBox("分析完成自动推送（闲置不发消息）")
+        self._notify_enabled.setChecked(f.notify_enabled)
         self._webhook = QLineEdit(f.webhook_url)
         self._secret = QLineEdit(f.secret)
         self._app_id = QLineEdit(f.app_id)
         self._app_secret = QLineEdit(f.app_secret)
         self._app_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self._dedup = QSpinBox()
+        self._dedup.setRange(0, 60)
+        self._dedup.setSuffix(" 分钟")
+        self._dedup.setValue(f.push_dedup_minutes)
+        self._prob_th = QDoubleSpinBox()
+        self._prob_th.setRange(50.0, 95.0)
+        self._prob_th.setSingleStep(0.5)
+        self._prob_th.setSuffix(" %")
+        self._prob_th.setValue(f.push_prob_threshold)
 
         self._form.addRow("", self._enabled)
+        self._form.addRow("", self._notify_enabled)
         self._form.addRow("Webhook 地址:", self._webhook)
         self._form.addRow("签名 Secret:", self._secret)
         self._form.addRow("App ID (选填):", self._app_id)
         self._form.addRow("App Secret (选填):", self._app_secret)
+        self._form.addRow("同品种防抖间隔:", self._dedup)
+        self._form.addRow("概率红色加粗阈值:", self._prob_th)
 
     def _on_save(self) -> None:
         f = self._settings.feishu
         f.enabled = self._enabled.isChecked()
+        f.notify_enabled = self._notify_enabled.isChecked()
         f.webhook_url = self._webhook.text().strip()
         f.secret = self._secret.text().strip()
         f.app_id = self._app_id.text().strip()
         f.app_secret = self._app_secret.text().strip()
+        f.push_dedup_minutes = self._dedup.value()
+        f.push_prob_threshold = self._prob_th.value()
         _save(self._settings)
         super()._on_save()
 
@@ -165,6 +183,13 @@ class IndicatorDialog(_BaseDialog):
         self._swing_window.setRange(10, 100)
         self._swing_window.setValue(ind.swing_window)
 
+        # K线明细表格渲染样式：新版表格UI / 旧版纯文本（一键回滚）
+        self._table_style = QComboBox()
+        self._table_style.addItem("新版表格 UI（推荐）", "new")
+        self._table_style.addItem("旧版纯文本表格", "old")
+        idx = self._table_style.findData(g.table_style)
+        self._table_style.setCurrentIndex(idx if idx >= 0 else 0)
+
         self._form.addRow("K线数量:", self._bar_count)
         self._form.addRow("RSI 周期:", self._rsi_period)
         self._form.addRow("布林带周期:", self._bb_period)
@@ -174,11 +199,13 @@ class IndicatorDialog(_BaseDialog):
         self._form.addRow("价值区域占比:", self._va_pct)
         self._form.addRow("足迹失衡倍数:", self._fp_threshold)
         self._form.addRow("摆动检测窗口:", self._swing_window)
+        self._form.addRow("K线明细表格样式:", self._table_style)
 
     def _on_save(self) -> None:
         g = self._settings.general
         ind = self._settings.indicators
         g.analysis_bar_count = self._bar_count.value()
+        g.table_style = self._table_style.currentData() or "new"
         ind.rsi_period = self._rsi_period.value()
         ind.bollinger_period = self._bb_period.value()
         ind.bollinger_std = self._bb_std.value()
