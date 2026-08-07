@@ -383,7 +383,7 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _render_ai_tab(self, res, wa) -> str:
-        """问AI标签页：AI 分析结论 + 概率。"""
+        """问AI标签页：AI 分析结论 + 概率 + 思考过程 + Token 统计。"""
         if res is None or res.ai_diagnosis is None:
             return "尚未运行 AI 诊断。点击「📝 提交分析」以获取 AI 增强分析。"
         ai = res.ai_diagnosis
@@ -415,8 +415,36 @@ class MainWindow(QMainWindow):
             ]
         if ai.get("risk_warning"):
             lines += ["", f"⚠️ 风险: {ai['risk_warning']}"]
-        if res.usage:
-            lines += ["", f"── Token 用量 ──", str(res.usage)]
+
+        # ── Token / 上下文占用统计 ─────────────────────────────────────────
+        usage = res.usage or {}
+        reasoning = (res.ai_reasoning or "").strip()
+        completion_text = (res.ai_raw or "").strip()
+        reasoning_chars = len(reasoning)
+        completion_chars = len(completion_text)
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        reasoning_tokens = usage.get("reasoning_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+        ctx_window = getattr(self._settings.provider, "context_window", 2000000)
+        ctx_pct = total_tokens / ctx_window * 100 if ctx_window else 0
+
+        lines += [
+            "",
+            "── ⚙ 消耗统计 ──",
+            f"思考字数: {reasoning_chars:,} 字" + (f"（思考 Token {reasoning_tokens:,}）" if reasoning_tokens else ""),
+            f"回复字数: {completion_chars:,} 字（{completion_tokens:,} tokens）",
+            f"上下文占用: {total_tokens:,} / {ctx_window:,} tokens（{ctx_pct:.2f}%）",
+            f"耗时: {res.latency_ms / 1000:.1f}s",
+        ]
+
+        # ── 思考过程（DeepSeek reasoning_content）──────────────────────────
+        if reasoning:
+            lines += [
+                "",
+                "── 🧠 思考过程 ──",
+                reasoning,
+            ]
         return "\n".join(lines)
 
     # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────

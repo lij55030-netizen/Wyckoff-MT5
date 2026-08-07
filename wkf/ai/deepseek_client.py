@@ -67,6 +67,9 @@ class DeepSeekClient:
                 "prompt_tokens": resp.usage.prompt_tokens,
                 "completion_tokens": resp.usage.completion_tokens,
                 "total_tokens": resp.usage.total_tokens,
+                "reasoning_tokens": getattr(resp.usage, "completion_tokens_details", None) and getattr(
+                    resp.usage.completion_tokens_details, "reasoning_tokens", None
+                ) or 0,
             }
 
         return AIReply(
