@@ -207,7 +207,7 @@ td:first-child{{color:#8b949e;width:36%}}
 <tbody>{of_rows}</tbody>
 </table></div>
 
-<div class="disclaimer">⚠️ 订单流经 MT5 CFD (XAUUSD) 获取，tick 仅含 bid/ask，方向按 Tick Rule 近似分类，成交量为 tick 计数近似值。威科夫判断为概率化场景，不构成投资建议。</div>
+<div class="disclaimer">⚠️ 风险提示：订单流由 MT5 Tick 数据近似换算生成，并非交易所原始盘口订单流，仅用于威科夫结构定性研判，不建议作为高频短线交易依据。以上分析仅供参考，不构成投资建议。</div>
 </body></html>"""
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

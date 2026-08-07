@@ -1,33 +1,36 @@
-"""WKF 主窗口：图表 + 控制 + 分析结果面板（数据/快照/诊断/决策/问AI）。"""
+"""WKF 主窗口：全局初始化、页面调度、信号绑定（业务逻辑委托子控件）。
+
+【改动点】需求一.1：架构重构——主窗口渐进式拆分。
+ - K线图表组件：wkf/gui/chart_widget.py（既有）
+ - 顶部控制组件：wkf/gui/widgets/top_bar.py（新增）
+ - K线明细表格：wkf/gui/widgets/kline_table.py（新增）
+ - 快照面板：wkf/gui/widgets/snapshot_panel.py（新增）
+ - 诊断面板：wkf/gui/widgets/diagnosis_panel.py（新增）
+ - 决策面板：wkf/gui/widgets/decision_panel.py（新增）
+ - 历史记录面板：wkf/gui/widgets/history_panel.py（新增）
+ - AI对话面板：wkf/gui/widgets/ai_chat.py（新增）
+ 本文件仅保留：窗口初始化、子控件组装、信号绑定、线程/定时器调度、
+ 数据获取与分析的编排（不承载任何面板渲染与指标计算）。
+【涉及文件】wkf/gui/main_window.py（重构）
+【验证方式】python -m unittest discover tests；tools/test_v130/v131/v24/switch 全量回归。
+"""
 from __future__ import annotations
 
 import datetime
 import html
-import math
 import sys
 import threading
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QCheckBox,
-    QComboBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenuBar,
-    QPushButton,
-    QPlainTextEdit,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +40,14 @@ from wkf.data.base import KlineFrame
 from wkf.data.mt5_source import resolve_mt5_symbol
 from wkf.gui.chart_widget import WkfChart
 from wkf.gui.settings_dialogs import AIModelDialog, FeishuDialog, IndicatorDialog
+from wkf.gui.widgets.ai_chat import AiChatWidget
+from wkf.gui.widgets.backtest_panel import BacktestPanel
+from wkf.gui.widgets.decision_panel import DecisionPanel, compute_probabilities
+from wkf.gui.widgets.diagnosis_panel import DiagnosisPanel
+from wkf.gui.widgets.history_panel import HistoryPanel
+from wkf.gui.widgets.kline_table import KlineTableWidget
+from wkf.gui.widgets.snapshot_panel import SnapshotPanel
+from wkf.gui.widgets.top_bar import TopControlBar
 from wkf.util.timefmt import beijing_now_str
 from wkf.orchestrator.runner import (
     AnalysisResult,
@@ -49,9 +60,7 @@ SYMBOLS = ["NQ1!", "ES1!", "GC1!"]
 # 【改动点】周期下拉选项扩容 + 固定排序（短线→长线）。
 # 显示文本（中文）与内部键（供接口/存储使用）分离：下拉显示"1分"等，
 # itemData 存内部键（1m/3m/.../1w），下游全部使用内部键，互不干扰。
-# 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py / config_const.py）
-# 【验证方式】打开周期下拉，顺序严格为 1分→3分→5分→10分→15分→30分→60分→120分→240分→日线→周线；
-#             选中日线/周线可正常拉取对应级别K线。
+# 【验证方式】打开周期下拉，顺序严格为 1分→3分→5分→10分→15分→30分→60分→120分→240分→日线→周线
 TIMEFRAME_ITEMS = [
     ("1分", "1m"), ("3分", "3m"), ("5分", "5m"), ("10分", "10m"),
     ("15分", "15m"), ("30分", "30m"), ("60分", "1h"),
@@ -59,7 +68,6 @@ TIMEFRAME_ITEMS = [
 ]
 TIMEFRAMES = [key for _, key in TIMEFRAME_ITEMS]  # 内部键列表（兼容既有代码）
 # 【改动点】周期→分钟映射：日线=1440分钟、周线=10080分钟（用于接口请求参数转换）
-# 【验证方式】_window_bar_count / TF_MINUTES 查询：1d=1440、1w=10080
 TF_MINUTES = {
     "1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
     "1h": 60, "2h": 120, "4h": 240, "1d": 1440, "1w": 10080,
@@ -67,179 +75,48 @@ TF_MINUTES = {
 # 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口；日线/周线单独指定根数）
 WINDOW_HOURS = 48
 # 【改动点】④K线内存缓存有效期（秒）：短周期重复切换命中缓存直接渲染，无需重请求
-# 【涉及文件】wkf/gui/main_window.py（对应 data_fetcher.py）
-# 【验证方式】同品种往返切换第二次起毫秒级响应
 CACHE_TTL_S = 60
 
+# 兼容旧引用（架构重构：子控件类已迁至 wkf.gui.widgets，保留别名避免破坏旧导入）
+_KlineTableWidget = KlineTableWidget
+_AiChatWidget = AiChatWidget
 
-class _KlineTableWidget(QWidget):
-    """数据标签页容器：顶部状态行 + K线明细表格（UI 展示优化版）。
 
-    仅做前端展示渲染，不涉及任何行情数据/指标计算/业务逻辑。
-    提供 toPlainText() 兼容方法，保持原纯文本表格的外部读取语义。
+class _FetchThread(QThread):
+    """行情数据异步加载线程（核心优化1）。
+
+    MT5/yfinance 历史K线拉取、Footprint 计算、订单流解析全部在子线程完成，
+    计算结束后经 done 信号一次性回传主线程渲染；子线程绝不操作画布控件。
     """
 
-    _HEADERS = ["#", "时间", "开", "高", "低", "收", "涨跌", "量", "RSI", "VWAP", "Δ"]
-    _WIDTHS = [40, 108, 62, 62, 62, 62, 52, 70, 66, 84, 58]  # 固定列宽
+    done = pyqtSignal(object, object, str, int)  # frame, wa, err, request_id
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, symbol: str, timeframe: str, bar_count: int,
+                 settings, request_id: int, parent=None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color:#8b949e;font-size:12px;")
-        layout.addWidget(self.status_label)
-        self.table = QTableWidget()
-        self.table.setColumnCount(len(self._HEADERS))
-        self.table.setHorizontalHeaderLabels(self._HEADERS)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)  # 斑马线
-        self.table.setShowGrid(False)
-        # 表头加深底色 + 斑马线浅底色 + 全局配色（绿涨红跌）
-        self.table.setStyleSheet(
-            "QTableWidget{background-color:#0f1419;color:#e6edf3;"
-            "alternate-background-color:#161d26;font-size:12px;border:1px solid #2a3442;}"
-            "QTableWidget::item{padding:2px 6px;}"
-            "QHeaderView::section{background-color:#1e2632;color:#8b949e;"
-            "border:1px solid #2a3442;padding:4px 8px;font-weight:bold;font-size:12px;}"
-        )
-        hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)  # 固定列宽
-        for i, w in enumerate(self._WIDTHS):
-            self.table.setColumnWidth(i, w)
-        layout.addWidget(self.table)
+        self._symbol = symbol
+        self._timeframe = timeframe
+        self._bar_count = bar_count
+        self._settings = settings
+        self._request_id = request_id
 
-        # 旧版纯文本视图（默认隐藏）：「其他设置」表格样式一键回滚开关使用
-        self._text_view = QPlainTextEdit()
-        self._text_view.setReadOnly(True)
-        self._text_view.setMaximumBlockCount(2000)
-        self._text_view.hide()
-        layout.addWidget(self._text_view)
+    def run(self) -> None:
+        try:
+            from wkf.orchestrator.runner import fetch_frame_cached
 
-    def set_plain_mode(self, plain: bool, text: str = "") -> None:
-        """表格渲染模式切换：plain=True 显示旧版纯文本表格，False 显示新版 QTableWidget。"""
-        if plain:
-            if text:
-                self._text_view.setPlainText(text)
-            self._text_view.show()
-            self.table.hide()
-        else:
-            self._text_view.hide()
-            self.table.show()
-
-    def toPlainText(self) -> str:
-        """兼容方法：返回当前可见模式下的文本（供测试/外部读取）。"""
-        if self._text_view.isVisible():
-            return self._text_view.toPlainText()
-        lines = [self.status_label.text()]
-        lines.append("序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 涨跌 | 成交量 | RSI | VWAP | Δ")
-        for r in range(self.table.rowCount()):
-            row = [
-                self.table.item(r, c).text() if self.table.item(r, c) else ""
-                for c in range(self.table.columnCount())
-            ]
-            lines.append(" | ".join(row))
-        return "\n".join(lines)
-
-
-class _AiChatWidget(QWidget):
-    """问AI标签页：上层对话展示区 + 底部输入框/发送按钮（深色样式）。
-
-    仅负责 UI 展示与输入；提问逻辑由 MainWindow._on_ai_send 处理。
-    """
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(6)
-
-        # 上层：对话展示区（只读富文本）
-        self.view = QTextEdit()
-        self.view.setReadOnly(True)
-        self.view.setStyleSheet(
-            "QTextEdit{background-color:#0f1419;color:#e6edf3;"
-            "border:1px solid #2a3442;border-radius:6px;font-size:13px;}"
-        )
-        layout.addWidget(self.view, stretch=1)
-
-        # 底部：输入框 + 发送按钮（适配深色样式）
-        input_row = QHBoxLayout()
-        input_row.setSpacing(6)
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("输入问题，回车发送（基于当前分析结果提问）...")
-        self.input.setStyleSheet(
-            "QLineEdit{background-color:#1e2632;color:#e6edf3;"
-            "border:1px solid #2a3442;border-radius:6px;padding:7px 10px;font-size:13px;}"
-            "QLineEdit:focus{border-color:#3b82f6;}"
-        )
-        self.send_btn = QPushButton("发送")
-        self.send_btn.setStyleSheet(
-            "QPushButton{background-color:#3b82f6;color:#fff;border:none;"
-            "border-radius:6px;padding:7px 18px;font-size:13px;font-weight:bold;}"
-            "QPushButton:hover{background-color:#2563eb;}"
-            "QPushButton:disabled{background-color:#334155;}"
-        )
-        input_row.addWidget(self.input, stretch=1)
-        input_row.addWidget(self.send_btn)
-        layout.addLayout(input_row)
-
-    def append_user(self, text: str) -> None:
-        self.view.append(
-            f"<p style='margin:4px 0'><b style='color:#3b82f6'>你：</b>"
-            f"<span style='color:#e6edf3'>{html.escape(text)}</span></p>"
-        )
-
-    def append_ai(self, body_html: str) -> None:
-        self.view.append(
-            f"<p style='margin:4px 0'><b style='color:#a78bfa'>AI：</b>{body_html}</p>"
-        )
-
-    def append_error(self, text: str) -> None:
-        self.view.append(
-            f"<p style='margin:4px 0'><b style='color:#ef4444'>⚠ {html.escape(text)}</b></p>"
-        )
-
-    def update_last_ai(self, body_html: str) -> None:
-        """把最后一条 AI 消息替换为正式回复（"思考中…"占位原地更新）。"""
-        from PyQt6.QtGui import QTextCursor
-
-        cursor = self.view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-        cursor.removeSelectedText()
-        cursor.insertHtml(
-            f"<p style='margin:4px 0'><b style='color:#a78bfa'>AI：</b>{body_html}</p>"
-        )
-        self.view.setTextCursor(cursor)
-        self.view.ensureCursorVisible()
-
-    def show_analysis(self, plain_text: str) -> None:
-        """分析完成后：清空对话区并展示本次分析摘要（作为首条上下文）。"""
-        self.view.clear()
-        self.view.setPlainText(plain_text)
-
-    def append_log(self, title: str, body_plain: str) -> None:
-        """追加一条分析日志（提交分析联动：完整推理过程 + Token 消耗）。"""
-        body_html = html.escape(body_plain).replace("\n", "<br>")
-        self.view.append(
-            f"<p style='margin:8px 0 2px;border-top:1px solid #2a3442;padding-top:6px'>"
-            f"<b style='color:#f59e0b'>📋 {html.escape(title)}</b></p>"
-            f"<div style='color:#e6edf3'>{body_html}</div>"
-        )
-        sb = self.view.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def toPlainText(self) -> str:
-        return self.view.toPlainText()
+            frame, wa, err, _from_cache = fetch_frame_cached(
+                self._symbol, self._timeframe,
+                bar_count=self._bar_count, settings=self._settings,
+                use_disk_cache=True,
+            )
+            self.done.emit(frame, wa, err, self._request_id)
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(None, None, str(exc), self._request_id)
 
 
 class MainWindow(QMainWindow):
     # 工作线程 → UI 线程信号（PyQt6 线程安全回调）
-    _fetch_done = pyqtSignal(object, object, str)  # frame, wyckoff, err
+    _fetch_done = pyqtSignal(object, object, str, int)  # frame, wyckoff, err, request_id
     _analysis_done = pyqtSignal(object)  # AnalysisResult
     _ai_reply = pyqtSignal(str)  # 问AI对话回复（工作线程 → UI 线程）
     _tick_updated = pyqtSignal(float)  # 最新成交价 tick 到达（工作线程 → UI 线程）
@@ -252,7 +129,6 @@ class MainWindow(QMainWindow):
         self._settings = load_settings()
         self._fetch_done.connect(self._on_fetch_done)
         self._analysis_done.connect(self._on_analysis_done)
-
 
         # ── 菜单栏 ─────────────────────────────────────────────────────────
         menubar = self.menuBar()
@@ -269,165 +145,126 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ── 控制栏 ─────────────────────────────────────────────────────────
-        ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("品种:"))
-        self._sym_combo = QComboBox()
-        self._sym_combo.addItems(SYMBOLS)
-        ctrl.addWidget(self._sym_combo)
+        # ── 顶部控制组件（品种/周期/按钮/状态/北京时钟）───────────────────
+        self._top = TopControlBar()
+        self._sym_combo = self._top._sym_combo
+        self._tf_combo = self._top._tf_combo
+        self._fetch_btn = self._top._fetch_btn
+        self._analyze_btn = self._top._analyze_btn
+        self._auto_check = self._top._auto_check
+        self._crosshair_btn = self._top._crosshair_btn
+        self._ds_combo = self._top._ds_combo
+        self._kline_status = self._top._kline_status
+        self._clock_label = self._top._clock_label
 
-        ctrl.addWidget(QLabel("周期:"))
-        # 【改动点】周期下拉：显示中文文本(1分…日线/周线)，itemData 存内部键；
-        #           开启自适应宽度（AdjustToContents），窗口缩放/高分屏/小窗口不截断。
-        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
-        # 【验证方式】拖动窗口放大缩小，打开周期下拉无文字截断；切换1分/日线/周线均可加载图表。
-        self._tf_combo = QComboBox()
-        self._tf_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToContents
+        # 【改动点】需求三：数据源模式 → 品种列表。
+        # MT5 模式：NQ1!/ES1!/GC1!；yfinance 模式：BTC-USD/^GSPC/^NDX/^DJI。
+        # 切换数据源后重启生效（品种下拉内容随模式变化）。
+        self._symbols = list(SYMBOLS)
+        try:
+            if getattr(self._settings.general, "data_source", "mt5") == "yfinance":
+                from wkf.data.datasource import get_data_source
+
+                src = get_data_source("yfinance")
+                self._symbols = src.available_symbols() or self._symbols
+        except Exception:
+            pass
+        self._sym_combo.addItems(self._symbols)
+        # 数据源下拉：按当前配置选中（MT5 / YFinance）
+        ds_idx = self._ds_combo.findData(
+            getattr(self._settings.general, "data_source", "mt5")
         )
+        self._ds_combo.setCurrentIndex(ds_idx if ds_idx >= 0 else 0)
+        # 周期下拉：显示中文文本(1分…日线/周线)，itemData 存内部键
         for label, key in TIMEFRAME_ITEMS:
             self._tf_combo.addItem(label, key)
-        # 【改动点】默认配置恢复：读取 settings 中的 last_symbol/last_timeframe，
-        #           默认品种 XAU/USD(GC1!)、默认周期 5 分钟。
-        # 【涉及文件】wkf/gui/main_window.py + wkf/config/settings.py（对应 config_manager.py）
-        # 【验证方式】首次启动品种=GC1!(XAU)、周期=5分；重启后记忆保留。
+        # 默认配置恢复：读取 settings 中的 last_symbol/last_timeframe，
+        # 默认品种 XAU/USD(GC1!)、默认周期 5 分钟。
         init_sym = getattr(self._settings.general, "last_symbol", "GC1!") or "GC1!"
         init_tf = getattr(self._settings.general, "last_timeframe", "5m") or "5m"
-        if init_sym in SYMBOLS:
+        if init_sym in self._symbols:
             self._sym_combo.setCurrentText(init_sym)
         idx = self._tf_combo.findData(init_tf)
         self._tf_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        ctrl.addWidget(self._tf_combo)
+        root.addWidget(self._top)
 
         # 品种/周期变更 → 自动刷新图表（带 300ms 防抖，快速连续切换只发最后一次请求）
-        # 关键修复：之前下拉框未连接任何信号，切换品种后图表从不刷新
         self._sym_combo.currentIndexChanged.connect(self._on_selector_changed)
         self._tf_combo.currentIndexChanged.connect(self._on_selector_changed)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(300)
         self._debounce_timer.timeout.connect(self._on_fetch_data)
-
-        self._fetch_btn = QPushButton("🔄 获取数据")
         self._fetch_btn.clicked.connect(self._on_fetch_data)
-        ctrl.addWidget(self._fetch_btn)
-
-        self._analyze_btn = QPushButton("📝 提交分析")
         self._analyze_btn.clicked.connect(self._on_analyze)
-        ctrl.addWidget(self._analyze_btn)
-
-        self._auto_check = QCheckBox("♾ 持续跟踪分析")
-        self._auto_check.setToolTip(
-            "开启后自动轮询 MT5，检测到新 K 线收盘即自动重新提交完整分析（含 AI），"
-            "持续跟踪最新行情；每次结果自动加入左侧历史记录"
-        )
         self._auto_check.toggled.connect(self._on_auto_toggle)
-        ctrl.addWidget(self._auto_check)
-
-        # 十字光标工具：可点击开关，激活后十字线跟随鼠标吸附最近K线显示 OHLC+时间戳
-        self._crosshair_btn = QPushButton("➕ 十字光标")
-        self._crosshair_btn.setCheckable(True)  # 可点击开关：点击激活/再点关闭
-        self._crosshair_btn.setToolTip(
-            "开启/关闭十字线光标：激活后鼠标在图表区移动自动吸附最近K线，"
-            "显示该K线的开/高/低/收与时间戳；离开图表区域自动隐藏"
-        )
         self._crosshair_btn.toggled.connect(self._on_crosshair_toggle)
-        ctrl.addWidget(self._crosshair_btn)
-
-        self._kline_status = QLabel("K线: --")
-        self._kline_status.setStyleSheet("color:#8b949e;font-size:12px")
-        ctrl.addWidget(self._kline_status)
-
-        # 【改动点】顶部状态栏新增常驻北京时间时钟控件（HH:MM:SS，独立 1 秒定时器刷新）。
-        # 与决策面板分析时间共用 beijing_now 时间源，时区强制 Asia/Shanghai。
-        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
-        # 【验证方式】修改系统时区为欧美时区，顶部依旧显示北京时间并每秒走动
-        self._clock_label = QLabel("🕐 --:--:--")
-        self._clock_label.setStyleSheet(
-            "color:#f59e0b;font-size:12px;font-weight:bold;padding:0 6px;"
-            "border:1px solid #2a3442;border-radius:4px;background:#161d26;"
-        )
-        self._clock_label.setToolTip("当前北京时间（东八区）")
-        ctrl.addWidget(self._clock_label)
-        ctrl.addStretch(1)
-        root.addLayout(ctrl)
+        self._ds_combo.currentIndexChanged.connect(self._on_data_source_changed)
 
         # ── 图表 + 分析结果面板（历史 + 标签页）────────────────────────────
         split = QSplitter(Qt.Orientation.Vertical)
         self._chart = WkfChart()
         split.addWidget(self._chart)
 
-        # 结果区：左侧历史记录列表 + 右侧标签页（数据/快照/诊断/决策/问AI）
+        # 【改动点】V1.3.3 图表交互：空格键重置图表为完整视图。
+        from PyQt6.QtGui import QKeySequence, QShortcut
+
+        self._reset_view_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._reset_view_shortcut.activated.connect(self._chart.reset_view)
+
+        # 【改动点】V1.3.3：底部状态栏实时展示当前激活数据源名称。
+        self.statusBar().showMessage(f"行情数据源：{self._data_source_label()}", 0)
+
+        # 结果区：左侧历史记录面板 + 右侧标签页（数据/快照/诊断/决策/问AI）
         result_split = QSplitter(Qt.Orientation.Horizontal)
 
-        history_panel = QWidget()
-        hist_layout = QVBoxLayout(history_panel)
-        hist_layout.setContentsMargins(0, 0, 0, 0)
-        hist_layout.addWidget(QLabel("📋 分析历史"))
-        self._history_list = QPlainTextEdit()
-        self._history_list.setReadOnly(True)
-        self._history_list.setMaximumBlockCount(500)
-        self._history_list.setFixedWidth(170)
-        hist_layout.addWidget(self._history_list)
-        result_split.addWidget(history_panel)
+        self._history_panel = HistoryPanel()
+        self._history_list = self._history_panel._history_list
+        result_split.addWidget(self._history_panel)
 
         # 5 个标签页
         tabs = QTabWidget()
-        # 数据标签页：状态行 + K线明细表格（UI 展示优化，_KlineTableWidget 自带 toPlainText 兼容）
-        self._tab_data = _KlineTableWidget()
+        # 数据标签页：K线明细表格（UI 展示优化，自带 toPlainText 兼容）
+        self._tab_data = KlineTableWidget()
         self._table_status = self._tab_data.status_label
         self._data_table = self._tab_data.table
         tabs.addTab(self._tab_data, "📊 数据")
 
-        # 【改动点】快照标签页：容器化（保存按钮 + 正文 + 底部生成时间）。
-        # 行情快照保存文件名嵌入北京时间戳；预览面板底部常驻展示快照生成时间。
-        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 snapshot_widget.py / snapshot_manager.py）
-        # 【验证方式】点「保存快照」→ output/snapshot_YYYYMMDD_HHMMSS.txt；预览底部显示北京时间
-        self._tab_snapshot = QWidget()
-        snap_layout = QVBoxLayout(self._tab_snapshot)
-        snap_layout.setContentsMargins(4, 4, 4, 4)
-        snap_layout.setSpacing(4)
-        snap_bar = QHBoxLayout()
-        self._snapshot_save_btn = QPushButton("💾 保存快照")
-        self._snapshot_save_btn.setToolTip("将当前行情快照保存为文件（文件名含北京时间戳）")
+        # 快照标签页：保存按钮 + 正文 + 底部生成时间
+        self._tab_snapshot = SnapshotPanel()
+        self._snapshot_save_btn = self._tab_snapshot.save_btn
+        self._tab_snapshot_text = self._tab_snapshot.text_view
+        self._snapshot_time_label = self._tab_snapshot.time_label
         self._snapshot_save_btn.clicked.connect(self._save_snapshot)
-        snap_bar.addWidget(self._snapshot_save_btn)
-        snap_bar.addStretch(1)
-        snap_layout.addLayout(snap_bar)
-        self._tab_snapshot_text = QPlainTextEdit()
-        self._tab_snapshot_text.setReadOnly(True)
-        self._tab_snapshot_text.setMaximumBlockCount(2000)
-        snap_layout.addWidget(self._tab_snapshot_text)
-        self._snapshot_time_label = QLabel("快照生成时间：--")
-        self._snapshot_time_label.setStyleSheet("color:#8b949e;font-size:12px;")
-        snap_layout.addWidget(self._snapshot_time_label)
         tabs.addTab(self._tab_snapshot, "📸 快照")
 
-        self._tab_diagnosis = QPlainTextEdit()
-        self._tab_diagnosis.setReadOnly(True)
-        self._tab_diagnosis.setMaximumBlockCount(2000)
-        tabs.addTab(self._tab_diagnosis, "🔍 诊断")
+        # 诊断标签页：顶部诊断生成时间 + 威科夫三层推理
+        self._tab_diagnosis_panel = DiagnosisPanel()
+        self._tab_diagnosis = self._tab_diagnosis_panel.text_view
+        tabs.addTab(self._tab_diagnosis_panel, "🔍 诊断")
 
-        self._tab_decision = QTextEdit()  # 决策页：富文本（红色粗体核心结论）
-        self._tab_decision.setReadOnly(True)
-        self._tab_decision.setStyleSheet(
-            "QTextEdit{background-color:#0f1419;color:#e6edf3;border:none;font-size:13px;}"
-        )
-        tabs.addTab(self._tab_decision, "🎯 决策")
+        # 决策标签页：富文本四段决策 + 概率总结（红色粗体）
+        self._tab_decision_panel = DecisionPanel()
+        self._tab_decision = self._tab_decision_panel.view
+        tabs.addTab(self._tab_decision_panel, "🎯 决策")
 
         # 问AI页：对话容器（上层展示区 + 底部输入框/发送按钮，回车发送）
-        self._tab_ai = _AiChatWidget()
+        self._tab_ai = AiChatWidget()
         self._tab_ai.input.returnPressed.connect(self._on_ai_send)
         self._tab_ai.send_btn.clicked.connect(self._on_ai_send)
         tabs.addTab(self._tab_ai, "🤖 问AI")
 
+        # 【改动点】需求四：新增回测标签页（只读信号复盘统计，表格展示）
+        # 【涉及文件】wkf/gui/main_window.py + wkf/gui/widgets/backtest_panel.py
+        # 【验证方式】打开回测标签页可见统计表；分析完成后自动刷新
+        self._tab_backtest = BacktestPanel()
+        self._tab_backtest.refresh_btn.clicked.connect(self._tab_backtest.refresh)
+        tabs.addTab(self._tab_backtest, "📈 回测")
+        self._tab_backtest.refresh()
+
         # 【改动点】Tab 栏右侧新增静态邮箱标签（禁止下拉菜单，控件选型为 QLabel；
         #           开启文本可选中复制）。位于「问AI」标签右侧。
-        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
-        # 【验证方式】问AI标签右侧可见邮箱文本，鼠标可选中复制
-        from PyQt6.QtWidgets import QLabel as _QL
-
-        self._contact_label = _QL("　技术对接：lij55030@gmail.com")
+        self._contact_label = QLabel("　技术对接：lij55030@gmail.com")
         self._contact_label.setStyleSheet(
             "color:#8b949e;font-size:12px;padding:0 8px;background:transparent;"
         )
@@ -450,6 +287,15 @@ class MainWindow(QMainWindow):
         self._auto_active = False
         self._last_bar_ts = 0
         self._analysis_busy = False
+        # 【改动点】异步加载迭代：全局加载锁 + 请求序号 + 当前工作线程引用。
+        #  - _loading=True 时忽略新的切换触发（不排队，仅记录 pending 最后意图）；
+        #  - _fetch_seq 递增序号用于丢弃过期响应（与 _fetch_req 令牌双重校验）。
+        self._loading = False
+        self._switching = False  # 切换防抖窗口内（尚未进入加载）也锁定状态栏提示
+        self._fetch_seq = 0
+        self._fetch_thread: _FetchThread | None = None
+        self._pending_switch: tuple | None = None
+        self._crosshair_suspended = False
         self._history_count = 0
         self._has_ai_result = False
         self._analysis_time = ""  # 本次分析时间（年月日时分秒），决策面板/历史/飞书统一使用
@@ -465,9 +311,7 @@ class MainWindow(QMainWindow):
         # 请求令牌：记录最近一次 fetch/analyze 请求对应的品种+周期，
         # 响应返回时若用户已切换，则丢弃过期结果，防止旧品种数据覆盖新图表
         self._fetch_req = ("", "")
-        # K线收盘倒计时：1 秒定时器秒级实时刷新；MT5 时间戳每 5 秒校准一次（避免高频连接）
-        # 服务器时钟偏移：MT5 bar/tick 时间基于服务器时钟（实测比真实 UTC 快 3 小时），
-        # 与 time.time()（真实 UTC）不同基准，须测量偏移后对齐，否则倒计时偏差数小时
+        # K线收盘倒计时：1 秒定时器秒级实时刷新；MT5 时间戳每 5 秒校准一次
         self._server_offset_ms = 0
         self._status_ts = 0
         self._status_ts_fetched_at = 0.0
@@ -492,12 +336,16 @@ class MainWindow(QMainWindow):
         self._on_fetch_data()
         # 首次启动引导：自动创建目录 + 弹窗引导基础配置（AI Key / 飞书 Webhook）
         self._first_run_setup()
+        # 【改动点】数据源模式检查（需求三）：yfinance 模式无 Tick 数据 →
+        # 弹窗提示 + 隐藏订单流面板（决策面板订单流区块由渲染层自动省略）。
+        # 【涉及文件】wkf/gui/main_window.py + wkf/data/datasource.py
+        # 【验证方式】settings 切到 yfinance 启动：弹窗提示"无Tick数据"；
+        #            决策面板不再出现订单流结构区块。
+        self._check_data_source_mode()
 
+    # ── 首次启动引导 ──────────────────────────────────────────────────────
     def _first_run_setup(self) -> None:
-        """首次启动：自动创建所需文件夹（output 报告/推送日志等）；弹窗引导基础配置。
-
-        引导完成后清除 first_run 标记，下次启动不再弹窗。
-        """
+        """首次启动：自动创建所需文件夹（output 报告/推送日志等）；弹窗引导基础配置。"""
         try:
             from wkf.config.settings import SETTINGS_JSON_PATH, save_settings
 
@@ -508,7 +356,6 @@ class MainWindow(QMainWindow):
 
         if not getattr(self._settings.general, "first_run", False):
             return
-        # 清除首次运行标记并落盘
         try:
             self._settings.general.first_run = False
             save_settings(self._settings, SETTINGS_JSON_PATH)
@@ -524,7 +371,6 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1200, lambda: self._show_first_run_guide(missing))
 
     def _show_first_run_guide(self, missing: list) -> None:
-        """首次启动引导弹窗：询问是否打开设置面板（不阻塞崩溃，可稍后配置）。"""
         if not self.isVisible():
             return
         from PyQt6.QtWidgets import QMessageBox
@@ -552,6 +398,8 @@ class MainWindow(QMainWindow):
         self._tick_timer.stop()
         self._status_timer.stop()
         self._auto_timer.stop()
+        if self._fetch_thread is not None and self._fetch_thread.isRunning():
+            self._fetch_thread.wait(2000)
         super().closeEvent(event)
 
     # ── 48 小时时间级别：按周期换算需要拉取的K线根数 ─────────────────────
@@ -560,7 +408,6 @@ class MainWindow(QMainWindow):
 
         【改动点】日线/周线不再套用 48 小时换算（会退化为 2 根/0 根），
         单独指定根数：日线 60 根、周线 30 根；其余周期保持 48 小时窗口。
-        【涉及文件】wkf/gui/main_window.py
         【验证方式】选择日线图表约 60 根、周线约 30 根，5分=576 根（48h）。
         """
         if timeframe == "1d":
@@ -581,17 +428,14 @@ class MainWindow(QMainWindow):
         """十字光标按钮点击：激活/关闭，带按钮视觉反馈。"""
         self._chart.set_crosshair_enabled(checked)
         if checked:
-            # 激活状态：按钮高亮 + 文字变关闭提示
             self._crosshair_btn.setText("⛔ 关闭光标")
             self._crosshair_btn.setStyleSheet(
                 "QPushButton{background-color:#1e3a5f;color:#e6edf3;"
                 "border:1px solid #3b82f6;border-radius:4px;padding:4px 10px;}"
             )
         else:
-            # 关闭状态：恢复默认样式（默认隐藏，不加载任何光标状态）
             self._crosshair_btn.setText("➕ 十字光标")
             self._crosshair_btn.setStyleSheet("")
-        # 注意：状态栏提示由 1 秒倒计时定时器持续刷新，此处不写状态栏避免被覆盖
 
     # ── 实时价格标注：后台轮询 MT5 tick，更新图表红线 ─────────────────────
     def _poll_tick(self) -> None:
@@ -605,8 +449,9 @@ class MainWindow(QMainWindow):
         def _work() -> None:
             try:
                 import MetaTrader5 as mt5
+                from wkf.data.mt5_source import ensure_mt5_initialized
 
-                if not mt5.initialize():
+                if not ensure_mt5_initialized(mt5):
                     return
                 try:
                     mt5_sym = resolve_mt5_symbol(sym)
@@ -628,14 +473,99 @@ class MainWindow(QMainWindow):
         """最新成交价到达（主线程）：更新图表红线与标签。"""
         self._chart.set_last_price(price)
 
-    def _on_selector_changed(self) -> None:
-        """品种/周期变更：周期记忆持久化 + 显示加载状态并防抖触发刷新。
+    # ── 数据源模式检查（需求三：yfinance 可选数据源）──────────────────────
+    def _check_data_source_mode(self) -> None:
+        """yfinance 模式：无 Tick 数据 → 弹窗提示 + 订单流相关功能自动隐藏。"""
+        try:
+            mode = getattr(self._settings.general, "data_source", "mt5")
+            if mode != "yfinance":
+                return
+            from PyQt6.QtWidgets import QMessageBox
 
-        【改动点】「品种-周期」独立记忆（settings.general.per_symbol_timeframe）：
+            QTimer.singleShot(
+                800,
+                lambda: QMessageBox.information(
+                    self,
+                    "数据源：yfinance 模式",
+                    "当前数据源为 yfinance（通用行情）。\n\n"
+                    "· 支持 BTC-USD、美股指数（^GSPC/^NDX/^DJI）等品种\n"
+                    "· 无 Tick 数据 → 订单流/足迹图/实时价格线已自动隐藏\n"
+                    "· 上层指标与威科夫结构分析逻辑不受影响\n\n"
+                    "如需恢复订单流功能，请在「⚙ 设置 → 其他设置 → 行情数据源」切回 MT5。",
+                ),
+            )
+        except Exception:
+            pass
+
+    # ── 行情数据源切换（V1.3.3：前端控件暴露，复用 datasource.py 工厂）──
+    def _data_source_label(self) -> str:
+        """当前激活数据源的中文名称（底部状态栏/诊断/快照共用）。"""
+        mode = getattr(self._settings.general, "data_source", "mt5")
+        return "MT5实盘数据源" if mode != "yfinance" else "YFinance公开数据源"
+
+    def _rebuild_symbols(self, mode: str) -> None:
+        """按数据源模式重建品种下拉（blockSignals 防止触发切换递归）。"""
+        new_symbols = list(SYMBOLS)
+        if mode == "yfinance":
+            try:
+                from wkf.data.datasource import get_data_source
+
+                src = get_data_source("yfinance")
+                new_symbols = src.available_symbols() or new_symbols
+            except Exception:
+                pass
+        self._symbols = new_symbols
+        self._sym_combo.blockSignals(True)
+        self._sym_combo.clear()
+        self._sym_combo.addItems(self._symbols)
+        self._sym_combo.blockSignals(False)
+
+    def _on_data_source_changed(self, _idx: int) -> None:
+        """行情数据源切换触发逻辑：
+        更新设置 → 清空图表缓存 → 异步拉取对应数据源K线 → 刷新图表。
+        底层复用 wkf.data.datasource 工厂（runner 取数已按 settings 走工厂）。
+        """
+        mode = self._ds_combo.currentData() or "mt5"
+        if mode == getattr(self._settings.general, "data_source", "mt5"):
+            return
+        self._settings.general.data_source = mode
+        try:
+            from wkf.config.settings import save_settings, SETTINGS_JSON_PATH
+
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+        except Exception:
+            pass
+        # 1. 清空图表缓存（内存帧缓存；磁盘 K 线缓存按品种/周期键隔离，无需删除）
+        self._frame_cache.clear()
+        self._last_frame = None
+        self._last_wa = None
+        self._has_ai_result = False
+        # 2. 重建品种列表（yfinance：BTC/美股指数；MT5：NQ/ES/XAU）
+        self._rebuild_symbols(mode)
+        # 3. 底部状态栏实时展示当前激活数据源
+        self.statusBar().showMessage(f"行情数据源：{self._data_source_label()}", 0)
+        # 4. 清空旧图表 + 触发异步加载（走统一加载链路，QThread 拉取）
+        sym = self._sym_combo.currentText()
+        tf = self._current_tf()
+        self._prepare_switch(sym, tf, is_symbol_change=True)
+        self._debounce_timer.start()
+
+    # ── 品种/周期切换：记忆持久化 + 防抖刷新 ──────────────────────────────
+    def _on_selector_changed(self) -> None:
+        """品种/周期变更：记忆持久化 + 全局加载锁 + 前置清理 + 防抖刷新。
+
+        【改动点】异步加载迭代（V1.3.2）：
+          · 全局加载锁：数据加载中（_loading=True）直接忽略新切换触发，
+            不排队不重复加载，仅记录最后一次意图（_pending_switch），
+            加载完成后自动补发，避免多任务堆积；
+          · 切换第一时间执行前置资源清理（_prepare_switch）：隐藏K线画布/
+            实时价格线/十字光标/指标图层，挂起Tick定时器与鼠标监听；
+          · 状态栏区分「品种数据加载中」/「周期重构渲染中」。
+
+        【历史改动点】「品种-周期」独立记忆（settings.general.per_symbol_timeframe）：
           · 品种切换：保存旧品种当前周期 → 恢复目标品种上次选用的周期（blockSignals 防递归）；
           · 周期切换：立即把新周期写入当前品种记忆并落盘；
           重启后记忆不丢失。
-        【涉及文件】wkf/gui/main_window.py（对应 config_manager.py 的读写）
         【验证方式】GC1! 选 30分 → 切 NQ1! 选 5分 → 切回 GC1! 自动恢复 30分；
                     关闭软件重启，品种与周期记忆保留。
         """
@@ -647,7 +577,7 @@ class MainWindow(QMainWindow):
 
         if sym != prev_sym:
             # 品种切换：保存旧品种周期记忆，恢复目标品种上次选用的周期
-            if prev_sym and prev_tf and prev_sym in SYMBOLS:
+            if prev_sym and prev_tf and prev_sym in self._symbols:
                 g.per_symbol_timeframe[prev_sym] = prev_tf
             saved = g.per_symbol_timeframe.get(sym)
             if saved and saved != tf:
@@ -672,29 +602,59 @@ class MainWindow(QMainWindow):
                 pass
 
         self._has_ai_result = False  # 新品种数据，旧 AI 结果作废
-        self._kline_status.setText(f"⏳ 切换中，加载 {sym} {tf} ...")
-        self._set_table_status(f"⏳ 正在加载 {sym} {tf}（48小时窗口）...")
-        self._data_table.setRowCount(0)
+
+        # 全局加载锁：加载中忽略新切换（不排队），仅记录最后一次意图
+        if self._loading:
+            self._pending_switch = (sym, tf)
+            return
+
+        # 切换动作第一时间：前置资源清理 + 挂起附属功能 + 状态提示
+        self._prepare_switch(sym, tf, is_symbol_change=(sym != prev_sym))
+        self._switching = True
         self._debounce_timer.start()
 
+    def _prepare_switch(self, symbol: str, timeframe: str, *, is_symbol_change: bool) -> None:
+        """切换前置资源清理提速（第一时间执行）。
+
+        1. 清空历史K线绘图 Item、VA/POC 指标图层（overlay 覆盖层独立保留，Z 层级不变）；
+        2. 销毁旧实时价格线/标签，重置十字光标绘制状态；
+        3. 临时挂起 Tick 价格定时器与鼠标光标监听；
+        4. 清空 K 线明细表格缓存，避免新旧数据叠加渲染。
+        """
+        # 1. 清空主图与 RSI 数据层（overlay 层独立保留）
+        self._chart.clear_items()
+        self._chart.clear_rsi()
+        # 2. 重置视图状态与旧数据帧（新数据强制 autoRange；十字线吸附基准一并失效）
+        self._chart.reset_view_state(symbol)
+        # 3. 隐藏实时价格线/十字光标 + 挂起鼠标监听（加载完成后恢复）
+        self._chart.suspend_interactions()
+        self._crosshair_suspended = True
+        # 4. 临时挂起 Tick 价格定时器（2 秒轮询），完成后重启
+        self._tick_timer.stop()
+        # 5. 清空 K 线明细表格缓存
+        self._data_table.setRowCount(0)
+        # 6. 状态栏加载提示：品种加载 / 周期重构区分文案
+        if is_symbol_change:
+            self._kline_status.setText(f"⏳ 品种数据加载中...（{symbol} {timeframe}）")
+            self._set_table_status(
+                f"⏳ 品种数据加载中...（{symbol} {timeframe}，{WINDOW_HOURS}h 窗口）"
+            )
+        else:
+            self._kline_status.setText(f"⏳ 周期重构渲染中...（{symbol} {timeframe}）")
+            self._set_table_status(
+                f"⏳ 周期重构渲染中...（{symbol} {timeframe}，{WINDOW_HOURS}h 窗口）"
+            )
+
+    # ── 历史记录 ──────────────────────────────────────────────────────────
     def _append_history(self, symbol: str, timeframe: str, bias: str, report: str,
                         time_str: str | None = None) -> None:
-        """把一次分析结果加入历史记录面板（方向文案汉化：long→多头等）。
-
-        time_str: 本次分析时间（年月日时分秒），与决策面板/飞书推送统一；
-        未传则取当前时间。
-        """
-        bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(bias, bias)
+        """把一次分析结果加入历史记录面板（方向文案汉化：long→多头等）。"""
         self._history_count += 1
-        ts = time_str or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{self._history_count}] {ts} {symbol} {timeframe}"
-        if bias_zh:
-            line += f" → {bias_zh}"
-        self._history_list.appendPlainText(line)
-        self._history_list.verticalScrollBar().setValue(
-            self._history_list.verticalScrollBar().maximum()
+        self._history_panel.append_history(
+            symbol, timeframe, bias, time_str=time_str, count=self._history_count
         )
 
+    # ── 设置对话框 ────────────────────────────────────────────────────────
     def _open_ai_dialog(self) -> None:
         dlg = AIModelDialog(self._settings, self)
         if dlg.exec() and self._ui_alive():
@@ -721,58 +681,87 @@ class MainWindow(QMainWindow):
             "关于 WKF",
             "<h3>WKF · 威科夫交易智能体</h3>"
             "<p>三层威科夫量化分析：背景判定 → 价值区域 → 订单流验证</p>"
-            "<p>支持 MT5 多周期（5m/10m/15m/30m/1h）× 多品种（NQ/ES/XAU）</p>"
+            "<p>支持 MT5 多周期（1分~周线）× 多品种（NQ/ES/XAU）</p>"
             "<p>AI 增强诊断（DeepSeek）+ 飞书指令机器人 + 新K线自动分析</p>"
             "<p>仅供学习研究，不构成投资建议。</p>",
         )
 
     # ── 获取数据（不跑 AI，快速刷新图表）─────────────────────────────────
     def _on_fetch_data(self) -> None:
+        """异步加载行情数据（核心优化1/2）。
+
+        拉取 + Footprint + 订单流解析全部在 _FetchThread 子线程完成，
+        完成后经 _fetch_done 信号一次性回主线程渲染；防抖定时器 + 全局加载锁
+        双重保证快速连续切换只执行最后一次有效请求，不产生堆积。
+        """
+        # 全局加载锁：加载中直接忽略新触发（防抖已合并 300ms 内的连切）
+        if self._loading:
+            return
         symbol = self._sym_combo.currentText()
         timeframe = self._current_tf()
         self._fetch_req = (symbol, timeframe)  # 记录请求令牌
+        self._fetch_seq += 1
+        req_id = self._fetch_seq
+        self._loading = True
         self._fetch_btn.setEnabled(False)
         bar_count = self._window_bar_count(timeframe)
         self._set_table_status(
-            f"⏳ 获取 {symbol} {timeframe} 数据（{WINDOW_HOURS}h 窗口，{bar_count} 根）..."
+            f"⏳ 数据加载中...（{symbol} {timeframe}，{WINDOW_HOURS}h 窗口，{bar_count} 根）"
         )
 
         # 【改动点】④K线内存缓存：同一(品种,周期) 60 秒内重复切换命中缓存，
         # 直接渲染无需重新拉取（MT5 拉取为耗时主因）。首次拉取仍走网络。
-        # 【涉及文件】wkf/gui/main_window.py（对应 data_fetcher.py 缓存层）
-        # 【验证方式】同品种往返快速切换：第二次起加载耗时显著下降（命中缓存≈毫秒级）
         key = (symbol, timeframe)
         hit = self._frame_cache.get(key)
         if hit is not None and time.monotonic() - hit[0] < CACHE_TTL_S:
             frame, wa = hit[1], hit[2]
-            self._fetch_btn.setEnabled(True)
-            self._fetch_done.emit(frame, wa, "")
+            self._fetch_done.emit(frame, wa, "", req_id)
             return
 
-        def _work() -> None:
-            # 【改动点】需求2：三级取数——内存缓存(外层已查) → 磁盘缓存 → MT5 网络。
-            # 磁盘命中跳过 MT5 与 tick 拉取（fetch_ticks=False），秒级出图；
-            # 首次拉取后写磁盘缓存，重复访问同一品种周期直接读取。
-            # 【涉及文件】wkf/gui/main_window.py + wkf/orchestrator/runner.py + wkf/data/cache_manager.py
-            # 【验证方式】同品种二次切换加载耗时显著下降（磁盘命中），cache/ 目录生成缓存文件
-            from wkf.orchestrator.runner import fetch_frame_cached
-
-            frame, wa, err, _from_cache = fetch_frame_cached(
-                symbol, timeframe, bar_count=bar_count, settings=self._settings,
-                use_disk_cache=True,
-            )
-            if frame is not None and not err:
+        def _on_worker_done(frame, wa, err: str, rid: int) -> None:
+            # 线程结束：释放引用，确保可回收
+            if self._fetch_thread is not None:
+                self._fetch_thread.deleteLater()
+                self._fetch_thread = None
+            if rid == req_id and frame is not None and not err:
                 self._frame_cache[key] = (time.monotonic(), frame, wa)
-            self._fetch_done.emit(frame, wa, err)
+            self._fetch_done.emit(frame, wa, err, rid)
 
-        threading.Thread(target=_work, name="wkf-fetch", daemon=True).start()
+        self._fetch_thread = _FetchThread(
+            symbol, timeframe, bar_count, self._settings, req_id, parent=self,
+        )
+        self._fetch_thread.done.connect(_on_worker_done)
+        self._fetch_thread.start()
 
-    def _on_fetch_done(self, frame, wa, err: str) -> None:
-        """获取数据完成（主线程）。"""
+    def _on_fetch_done(self, frame, wa, err: str, req_id: int) -> None:
+        """获取数据完成（主线程）：一次性渲染 + 恢复附属功能。"""
         self._fetch_btn.setEnabled(True)
-        # 防竞态：用户已切换品种/周期则丢弃过期响应
-        if self._fetch_req != (self._sym_combo.currentText(), self._current_tf()):
+        self._loading = False
+        self._switching = False
+        # 防竞态：请求序号不匹配 → 丢弃过期响应（快速连切只保留最后一次）
+        if req_id != self._fetch_seq:
             return
+        # 核心优化4：重载完成后恢复附属功能
+        mode = getattr(self._settings.general, "data_source", "mt5")
+        if mode != "yfinance":  # yfinance 无 Tick，不重启价格轮询
+            self._tick_timer.start(2000)
+        self._chart.resume_interactions()
+        self._crosshair_suspended = False
+
+        # 加载期间被忽略的最后一次切换：补发（走新一轮防抖，不并发排队）
+        if self._pending_switch and self._pending_switch != (
+            self._sym_combo.currentText(), self._current_tf()
+        ):
+            sym, tf = self._pending_switch
+            self._pending_switch = None
+            if sym in self._symbols:
+                self._sym_combo.setCurrentText(sym)
+            idx = self._tf_combo.findData(tf)
+            if idx >= 0:
+                self._tf_combo.setCurrentIndex(idx)
+            return  # _on_selector_changed 会启动新一轮防抖加载
+        self._pending_switch = None
+
         if err:
             self._set_table_status(f"❌ 获取失败: {err}")
             self._data_table.setRowCount(0)
@@ -792,7 +781,12 @@ class MainWindow(QMainWindow):
             latest_ts = datetime.datetime.fromtimestamp(frame.bars[0].ts_open / 1000).strftime("%H:%M")
             self._kline_status.setText(f"K线: {latest_ts} 收盘 · {WINDOW_HOURS}h 窗口 · {len(frame.bars)} 根")
 
+    # ── 提交分析 ──────────────────────────────────────────────────────────
     def _on_analyze(self) -> None:
+        # 全局加载锁：数据加载中拒绝分析，避免与分析/渲染竞态
+        if self._loading:
+            self._set_table_status("⏳ 数据加载中，请稍候再提交分析")
+            return
         symbol = self._sym_combo.currentText()
         timeframe = self._current_tf()
         self._fetch_req = (symbol, timeframe)  # 分析同样更新令牌
@@ -830,33 +824,45 @@ class MainWindow(QMainWindow):
         self._last_frame = res.frame
         self._last_wa = res.wyckoff
         self._last_res = res
-        # 本次分析时间：强制北京时间（Asia/Shanghai，与顶部时钟同一时间源）；
-        # 决策面板/历史记录/飞书推送统一使用该时间戳。
-        # 【改动点】datetime.now() → beijing_now_str()（时区锁定东八区）
-        # 【涉及文件】wkf/gui/main_window.py + wkf/util/timefmt.py
-        # 【验证方式】系统时区改为欧美时区后，决策面板分析时间仍为北京时间
+        # 本次分析时间：强制北京时间（Asia/Shanghai，与顶部时钟同一时间源）
         self._analysis_time = beijing_now_str()
         # 填充 5 个标签页
         self._populate_tabs(res.frame, res.wyckoff, res)
         # 历史记录（使用同一分析时间戳）
         bias = res.wyckoff.bias if res.wyckoff is not None else ""
         self._append_history(res.symbol, res.timeframe, bias, res.to_report(), self._analysis_time)
+        # 【改动点】需求四：分析完成 → 信号落盘存档 + 刷新回测标签页（只读统计）。
+        # 【涉及文件】wkf/gui/main_window.py + wkf/backtest/archive.py + wkf/backtest/statistics.py
+        # 【验证方式】分析后 output/history_archive.json 追加记录；回测页刷新计数+1
+        try:
+            if res.wyckoff is not None:
+                from wkf.backtest.archive import append_analysis_record
+
+                append_analysis_record(
+                    analysis_time=self._analysis_time,
+                    symbol=res.symbol,
+                    timeframe=res.timeframe,
+                    bias=res.wyckoff.bias,
+                    trigger=res.wyckoff.trigger,
+                    invalidation=res.wyckoff.invalidation,
+                    price=res.wyckoff.price,
+                    prob=compute_probabilities(res.wyckoff),
+                    ts_open=(res.frame.bars[0].ts_open if res.frame and res.frame.bars else None),
+                )
+                self._tab_backtest.refresh()
+        except Exception:
+            pass  # 存档失败不影响主流程
         # 【改动点】高概率行情提示音：综合概率（多/空取大值）> 60% 播放单次提示音。
-        # 防抖约束：单轮分析仅触发 1 次，30 秒内同品种不重复响铃（audio_player 内处理）；
-        # 无音频文件则静默不报错。注意与飞书 66.5% 高亮阈值区分：
-        #   60% = 本地铃声预警；66.5% = 飞书重点消息推送，两处独立。
-        # 【涉及文件】wkf/gui/main_window.py + wkf/util/audio_player.py
-        # 【验证方式】构造 62% 概率分析听到提示音；30 秒内同品种再分析无二次铃声
         if res.wyckoff is not None:
             try:
-                prob = self._compute_probabilities(res.wyckoff)
+                prob = compute_probabilities(res.wyckoff)
                 if max(prob.get("long", 0), prob.get("short", 0)) > 60:
                     from wkf.util.audio_player import play_alert
 
                     play_alert(res.symbol)
             except Exception:
                 pass
-        # 飞书推送：仅分析完成触发；防抖/高亮/日志均在 notifier 内处理（后台线程不阻塞 UI）
+        # 飞书推送：仅分析完成触发；防抖/高亮/日志均在 notifier 内处理
         self._spawn_feishu_push(res, bias)
 
     def _spawn_feishu_push(self, res: AnalysisResult, bias: str) -> None:
@@ -867,7 +873,7 @@ class MainWindow(QMainWindow):
             from wkf.notify.feishu_notifier import push_analysis_notice
 
             wa = res.wyckoff
-            prob = self._compute_probabilities(wa)
+            prob = compute_probabilities(wa)
             bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(wa.bias, wa.bias or "")
             va = wa.value_area
             of = wa.orderflow
@@ -897,381 +903,68 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # 推送失败不影响主流程
 
-    # ── K线明细表格：UI 展示优化（仅前端渲染，不改任何数据/业务逻辑）─────
+    # ── K线明细表格状态 ───────────────────────────────────────────────────
     def _set_table_status(self, text: str) -> None:
         """数据标签页顶部状态行。"""
         self._table_status.setText(text)
 
-    def _populate_data_table(self, frame) -> None:
-        """填充 K 线明细表格（最近 20 根，字段与原表格完全一致）。
-
-        展示规则（配色沿用项目绿涨红跌）：
-          · 涨跌列: 阳线 ↑绿 / 阴线 ↓红（移除文字）
-          · 成交量: 对比近 20 根均值, ≥1.2x 放量🔺 / ≤0.8x 缩量🔻 / 常态⚫
-          · RSI 列: >70 超买⚠️ / 30~70 常态●灰 / <30 超卖🔵
-          · Δ 列: 正数 ↑绿 / 负数 ↓红 / 0 值 —灰
-          · 收盘/VWAP/RSI 数值加粗高亮
-        """
-        if frame is None or not frame.bars:
-            self._data_table.setRowCount(0)
-            return
-        ind = frame.indicators
-        bars = frame.bars[:20]  # 与旧表格一致: 最近 20 根
-        vols = [b.volume for b in bars]
-        mean_vol = sum(vols) / len(vols) if vols else 0.0
-
-        n = len(bars)
-        self._data_table.setRowCount(n)
-        for i, b in enumerate(bars):
-            yang = b.close >= b.open
-            ts = datetime.datetime.fromtimestamp(b.ts_open / 1000).strftime("%m-%d %H:%M")
-            rsi = ind.rsi14[i] if i < len(ind.rsi14) and not math.isnan(ind.rsi14[i]) else None
-            vwap = ind.vwap[i] if i < len(ind.vwap) and not math.isnan(ind.vwap[i]) else None
-            # Δ 差值（修复长期空白/0 故障）：改为「当期收盘价 - 前一根收盘价」的价格差值，
-            # 表格首行（最新K线）不计算填横线；随行情刷新实时重算。
-            # bars 为新→旧排列，bars[i] 的前一根（时间更早）是 bars[i+1]。
-            if i == 0 or i + 1 >= len(bars):
-                delta = None
-            else:
-                delta = b.close - bars[i + 1].close
-
-            # 涨跌图标（阳↑绿 / 阴↓红）
-            trend_txt = "↑" if yang else "↓"
-            trend_color = "#22c55e" if yang else "#ef4444"
-            # 成交量图标（对比近 20 根均值）
-            ratio = b.volume / mean_vol if mean_vol else 1.0
-            vol_icon = "🔺" if ratio >= 1.2 else ("🔻" if ratio <= 0.8 else "⚫")
-            # RSI 状态图标
-            if rsi is None:
-                rsi_icon = "—"
-            elif rsi > 70:
-                rsi_icon = "⚠️"
-            elif rsi < 30:
-                rsi_icon = "🔵"
-            else:
-                rsi_icon = "●"
-            # Δ 差值（价格差，2 位小数）：正数 ↑绿 / 负数 ↓红 / 0 或缺失 —灰
-            if delta is None:
-                d_txt, d_color = "—", "#8b949e"
-            elif abs(delta) < 0.005:
-                d_txt, d_color = "—", "#8b949e"
-            elif delta > 0:
-                d_txt, d_color = f"↑{delta:+.2f}", "#22c55e"
-            else:
-                d_txt, d_color = f"↓{delta:+.2f}", "#ef4444"
-
-            vals = [
-                (str(b.seq), "#8b949e", False),            # 序号
-                (ts, None, False),                          # 时间(左对齐)
-                (f"{b.open:.2f}", None, False),             # 开
-                (f"{b.high:.2f}", None, False),             # 高
-                (f"{b.low:.2f}", None, False),              # 低
-                (f"{b.close:.2f}", None, True),             # 收(加粗)
-                (trend_txt, trend_color, False),            # 涨跌
-                (f"{vol_icon}{int(b.volume)}", None, False),  # 量(图标+数值)
-                (f"{rsi:.1f} {rsi_icon}" if rsi is not None else f"— {rsi_icon}", None, True),  # RSI(加粗)
-                (f"{vwap:.2f}" if vwap is not None else "—", None, True),  # VWAP(加粗)
-                (d_txt, d_color, False),                    # Δ
-            ]
-            for col, (text, color, bold) in enumerate(vals):
-                item = QTableWidgetItem(text)
-                if col == 1:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                else:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                if color:
-                    item.setForeground(QColor(color))
-                if bold:
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                self._data_table.setItem(i, col, item)
-
     def toPlainText(self) -> str:
         """兼容方法：返回表格文本（供测试/外部读取，保持原文本表格语义）。"""
-        lines = [self._table_status.text()]
-        lines.append("序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 涨跌 | 成交量 | RSI | VWAP | Δ")
-        for r in range(self._data_table.rowCount()):
-            row = [
-                self._data_table.item(r, c).text() if self._data_table.item(r, c) else ""
-                for c in range(self._data_table.columnCount())
-            ]
-            lines.append(" | ".join(row))
-        return "\n".join(lines)
+        return self._tab_data.toPlainText()
 
-    # ── 标签页内容渲染 ────────────────────────────────────────────────────
+    # ── 标签页内容渲染（委托子控件）──────────────────────────────────────
     def _populate_tabs(self, frame, wa, res) -> None:
         # K线明细表格渲染样式：「其他设置」可切换新版表格UI / 旧版纯文本（一键回滚）
         style = getattr(self._settings.general, "table_style", "new")
         if style == "old":
-            self._tab_data.set_plain_mode(True, self._render_data_tab(frame))
+            self._tab_data.set_plain_mode(True, self._tab_data.render_plain(frame))
         else:
             self._tab_data.set_plain_mode(False)
-            self._populate_data_table(frame)
-        self._tab_snapshot_text.setPlainText(self._render_snapshot_tab(frame, wa))
-        # 【改动点】快照预览底部展示生成时间（北京时间，与决策/诊断同源）
-        self._snapshot_time_label.setText(
-            f"快照生成时间：{beijing_now_str()}"
+            self._tab_data.populate(frame)
+        # 【改动点】V1.3.3：快照/诊断面板备注当前数据源来源（区分行情渠道）。
+        ds_label = self._data_source_label()
+        # 快照预览（底部展示生成时间，北京时间）
+        self._tab_snapshot.render(
+            frame, wa, generated_time=beijing_now_str(), data_source=ds_label
         )
-        # 【改动点】诊断面板顶部新增诊断生成时间（北京时间，与决策面板同源）
-        self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
-        self._tab_decision.setHtml(self._render_decision_tab(wa))  # 富文本（红色粗体结论）
+        # 诊断面板（顶部展示诊断生成时间，北京时间）
+        self._tab_diagnosis_panel.render(
+            wa, generated_time=beijing_now_str(), data_source=ds_label
+        )
+        # 决策面板（富文本四段 + 概率总结；红色粗体结论）
+        self._tab_decision_panel.render(wa, analysis_time=self._analysis_time)
         # 提交分析联动：在问AI面板自动追加一条完整分析日志（推理步骤 + Token 消耗）
         title = f"{frame.symbol} {frame.timeframe} 分析日志"
         self._tab_ai.append_log(title, self._render_ai_tab(res, wa))
 
+    # ── 旧渲染方法（保留为兼容转发；子控件已承载渲染逻辑）────────────────
     def _render_data_tab(self, frame) -> str:
-        """数据标签页：分析了哪些数据（K线明细表，保留原实现供兼容）。"""
-        if frame is None or not frame.bars:
-            return "无数据"
-        lines = [
-            f"=== 分析数据（{frame.symbol} {frame.timeframe}，共 {len(frame.bars)} 根K线）===",
-            "",
-            "序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 阳阴 | 量 | RSI | VWAP | Δ",
-            "-----|------|------|------|------|------|------|----|-----|------|-----",
-        ]
-        ind = frame.indicators
-        of = frame.orderflow
-        for i in range(min(20, len(frame.bars))):
-            b = frame.bars[i]
-            import datetime as _dt
-
-            ts = _dt.datetime.fromtimestamp(b.ts_open / 1000).strftime("%m-%d %H:%M")
-            yang = "阳" if b.close > b.open else "阴"
-            rsi = ind.rsi14[i] if i < len(ind.rsi14) and not math.isnan(ind.rsi14[i]) else "-"
-            vwap = ind.vwap[i] if i < len(ind.vwap) and not math.isnan(ind.vwap[i]) else "-"
-            d = of.delta[i] if of and i < len(of.delta) and not math.isnan(of.delta[i]) else "-"
-            rsi_s = f"{rsi:.1f}" if isinstance(rsi, float) else "-"
-            vwap_s = f"{vwap:.2f}" if isinstance(vwap, float) else "-"
-            d_s = f"{d:+.0f}" if isinstance(d, float) else "-"
-            lines.append(
-                f"{b.seq:<4} | {ts} | {b.open:.2f} | {b.high:.2f} | {b.low:.2f} | "
-                f"{b.close:.2f} | {yang} | {b.volume:.0f} | {rsi_s} | {vwap_s} | {d_s}"
-            )
-        return "\n".join(lines)
+        """兼容方法：数据标签页纯文本（委托子控件）。"""
+        return self._tab_data.render_plain(frame)
 
     def _render_snapshot_tab(self, frame, wa) -> str:
-        """快照标签页：当前行情快照。"""
-        if frame is None or not frame.bars:
-            return "无数据"
-        latest = frame.bars[0]
-        ind = frame.indicators
-        of = frame.orderflow
-        lines = [
-            f"=== 行情快照（{frame.symbol} {frame.timeframe}）===",
-            "",
-            f"最新价:   {latest.close:.2f}",
-            f"K线区间: {latest.low:.2f} - {latest.high:.2f}",
-            f"成交量:   {latest.volume:.0f}",
-            "",
-            "── 技术指标 ──",
-            f"RSI14:   {ind.rsi14[0]:.1f}" if not math.isnan(ind.rsi14[0]) else "RSI14:  -",
-            f"EMA20:   {ind.ema20[0]:.2f}" if not math.isnan(ind.ema20[0]) else "EMA20:  -",
-            f"ATR14:   {ind.atr14[0]:.2f}" if not math.isnan(ind.atr14[0]) else "ATR14:  -",
-            f"BB:      [{ind.bb_lower[0]:.2f}, {ind.bb_upper[0]:.2f}]",
-            f"VWAP:    {ind.vwap[0]:.2f}" if not math.isnan(ind.vwap[0]) else "VWAP:   -",
-        ]
-        if of is not None:
-            lines += [
-                "",
-                "── 订单流 ──",
-                f"Delta:   {of.delta[0]:+.0f}" if not math.isnan(of.delta[0]) else "Delta:  -",
-                f"累积Δ:   {of.cumulative_delta[0]:+.0f}",
-                f"POC:     {of.poc_price[0]:.2f}",
-                f"VA:      [{of.val[0]:.2f}, {of.vah[0]:.2f}]",
-            ]
-        return "\n".join(lines)
+        """兼容方法：快照文本（委托子控件）。"""
+        return self._tab_snapshot._build_text(frame, wa)
 
     def _render_diagnosis_tab(self, frame, wa) -> str:
-        """诊断标签页：为什么这么分析（威科夫三层推理）。
-
-        【改动点】顶部新增诊断生成时间（北京时间，与决策面板分析时间同源）。
-        【涉及文件】wkf/gui/main_window.py（对应假设文件 diagnosis_widget.py）
-        【验证方式】打开诊断标签可见顶部生成时间，且与决策面板时间一致
-        """
-        if wa is None:
-            return "未分析"
-        lines = [f"🔍 诊断生成时间：{beijing_now_str()}", ""]
-        lines.append(wa.render_text())
-        return "\n".join(lines)
-
-    def _save_snapshot(self) -> None:
-        """保存当前行情快照为文件（文件名嵌入北京时间戳）。
-
-        【改动点】快照保存：output/snapshot_YYYYMMDD_HHMMSS.txt，文件名含时间戳。
-        【涉及文件】wkf/gui/main_window.py（对应假设文件 snapshot_manager.py）
-        【验证方式】点击「保存快照」生成 output/snapshot_*.txt，文件名含北京时间
-        """
-        try:
-            from wkf.config.settings import SETTINGS_JSON_PATH
-
-            out_dir = SETTINGS_JSON_PATH.parent.parent / "output"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ts = beijing_now_str().replace("-", "").replace(":", "").replace(" ", "_")
-            path = out_dir / f"snapshot_{ts}.txt"
-            content = self._tab_snapshot_text.toPlainText()
-            if not content.strip():
-                content = self._snapshot_time_label.text()
-            path.write_text(
-                f"WKF 行情快照\n生成时间：{beijing_now_str()}\n{'=' * 40}\n{content}",
-                encoding="utf-8",
-            )
-            from PyQt6.QtWidgets import QMessageBox
-
-            QMessageBox.information(self, "快照已保存", f"已保存至：\n{path}")
-        except Exception as exc:
-            from PyQt6.QtWidgets import QMessageBox
-
-            QMessageBox.warning(self, "保存失败", f"快照保存失败：{exc}")
-
-    def _compute_probabilities(self, wa) -> dict:
-        """行情概率测算（确定性规则，完全基于 wa 现有盘面字段，可复现、不虚构）。
-
-        依据：
-          ① 趋势结构：regime + HH+HL / LH+LL 摆动计数
-          ② 订单流状态：active_side（买/卖方主导）+ reversal_stage
-          ③ VWAP 位置：现价高于/低于 VWAP（决定多空承压方向）
-        输出：空头/多头/震荡观望 三个概率（和为 100%）。
-        """
-        long_p, short_p, neutral_p = 33.0, 33.0, 34.0  # 中性基线
-
-        bg = wa.background
-        # ① 趋势结构
-        if bg.regime == "trend_up":
-            long_p += 15 + min(bg.hh_hl_count, 5) * 3
-            short_p -= 8
-        elif bg.regime == "trend_down":
-            short_p += 15 + min(bg.lh_ll_count, 5) * 3
-            long_p -= 8
-        elif bg.regime == "range":
-            neutral_p += 20
-            long_p -= 8
-            short_p -= 8
-
-        # ② 订单流状态
-        if wa.orderflow is not None:
-            of = wa.orderflow
-            if of.active_side == "buy":
-                long_p += 8
-            elif of.active_side == "sell":
-                short_p += 8
-            if of.reversal_stage == "absorption":
-                # 吸收阶段：多空趋于平衡，增加震荡权重
-                neutral_p += 5
-                long_p -= 2
-                short_p -= 3
-
-        # ③ VWAP 位置（价格承压/支撑方向）
-        if wa.value_area is not None and wa.value_area.vwap is not None and wa.price is not None:
-            if wa.price > wa.value_area.vwap:
-                long_p += 6
-            elif wa.price < wa.value_area.vwap:
-                short_p += 6
-
-        # 归一化到 100%（截断负值后按比例缩放）
-        long_p = max(0.0, long_p)
-        short_p = max(0.0, short_p)
-        neutral_p = max(0.0, neutral_p)
-        total = long_p + short_p + neutral_p
-        if total <= 0:
-            return {"short": 33, "long": 33, "neutral": 34}
-        long_pct = round(long_p / total * 100)
-        short_pct = round(short_p / total * 100)
-        neutral_pct = 100 - long_pct - short_pct  # 保证三项合计恒为 100
-        return {"short": short_pct, "long": long_pct, "neutral": neutral_pct}
+        """兼容方法：诊断文本（委托子控件）。"""
+        return self._tab_diagnosis_panel._build_text(wa, generated_time=beijing_now_str())
 
     def _render_decision_tab(self, wa) -> str:
-        """决策标签页（文案规范化重写）：行情倾向/入场触发/失效阈值/订单流结构/备注。
+        """兼容方法：决策 HTML（委托子控件）。"""
+        return self._tab_decision_panel._build_html(wa, analysis_time=self._analysis_time)
 
-        严格写实：全部内容仅基于 wa 中已计算出的盘面数据陈述，不做行情预判与夸大推演；
-        核心结论（行情倾向）使用红色粗体标注。
-        """
-        if wa is None:
-            return "未分析"
-        bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(wa.bias, wa.bias)
-        regime_zh = {
-            "trend_up": "上升趋势", "trend_down": "下降趋势",
-            "range": "区间震荡", "unknown": "结构不明",
-        }.get(wa.background.regime, wa.background.regime)
-        bg = wa.background
+    def _compute_probabilities(self, wa) -> dict:
+        """兼容方法：行情概率测算（委托 decision_panel 纯函数）。"""
+        return compute_probabilities(wa)
 
-        p = []
-        p.append("<div style='font-size:13px;line-height:1.8'>")
-        # 本次分析时间（北京时间，与顶部时钟同一时间源；重新分析自动刷新）
-        atime = getattr(self, "_analysis_time", "") or beijing_now_str()
-        p.append(
-            f"<p style='margin:0 0 8px;padding:6px 10px;background:#161d26;border-left:3px solid #f59e0b'>"
-            f"<b style='color:#f59e0b'>🕐 本次分析时间</b>"
-            f"　<span style='color:#e6edf3'>{atime}</span></p>"
-        )
-        p.append("<p style='margin:2px 0 8px'><b style='color:#8b949e'>交易决策（基于当前盘面数据，严格写实）</b></p>")
+    def _save_snapshot(self) -> None:
+        """保存当前行情快照为文件（文件名嵌入北京时间戳）。"""
+        self._tab_snapshot.save(parent=self)
 
-        # ① 行情倾向 —— 核心结论：红色粗体
-        p.append("<p style='margin:6px 0 2px'><b style='color:#e6edf3'>① 行情倾向</b></p>")
-        p.append(
-            f"<p style='margin:2px 0'><b><span style='color:#ef4444;font-size:15px'>{bias_zh}</span></b>"
-            f"　<span style='color:#8b949e'>背景：{regime_zh}（HH+HL {bg.hh_hl_count} 组 / LH+LL {bg.lh_ll_count} 组）</span></p>"
-        )
-
-        # ② 入场触发条件（点位红色加粗高亮）
-        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>② 入场触发条件</b></p>")
-        p.append(
-            f"<p style='margin:2px 0'><b><span style='color:#ef4444'>{html.escape(wa.trigger)}</span></b></p>"
-        )
-
-        # ③ 失效硬阈值（风控点位红色加粗高亮）
-        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>③ 失效硬阈值</b></p>")
-        p.append(
-            f"<p style='margin:2px 0'><b><span style='color:#ef4444'>{html.escape(wa.invalidation)}</span></b></p>"
-        )
-
-        # ④ 订单流结构
-        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>④ 订单流结构</b></p>")
-        if wa.orderflow is not None:
-            of = wa.orderflow
-            # 【改动点】订单流文本本地化汉化：活跃方/反转阶段英文→中文。
-            # 【涉及文件】wkf/gui/main_window.py（对应假设文件 analysis_report.py 决策文案生成）
-            # 【验证方式】执行一次行情分析，打开决策标签，订单流区域无任何英文词汇。
-            side_zh = {"buy": "买方", "sell": "卖方", "none": "无"}.get(
-                str(of.active_side).lower(), str(of.active_side))
-            stage_zh = {
-                "absorption": "吸收", "accumulation": "吸筹", "distribution": "派发",
-                "markup": "拉升", "markdown": "下跌", "active": "活跃", "none": "无",
-            }.get(str(of.reversal_stage).lower(), str(of.reversal_stage))
-            p.append(
-                f"<p style='margin:2px 0;color:#e6edf3'>活跃方：{side_zh}　|　反转阶段：{stage_zh}"
-                f"　|　失衡 {len(of.imbalances)} 处　|　堆叠 {len(of.stacked_imbalances)} 组</p>"
-            )
-        else:
-            p.append("<p style='margin:2px 0;color:#8b949e'>无订单流数据（Tick 数据不足）</p>")
-
-        # 备注
-        if wa.notes:
-            p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>⑤ 备注</b></p>")
-            for n in wa.notes:
-                # 【改动点】备注汉化：吸收阶段固定文案 + 其余英文关键词替换为中文
-                note = html.escape(n)
-                if wa.orderflow is not None and str(wa.orderflow.reversal_stage).lower() == "absorption":
-                    note = "订单流处于反转「吸收」阶段，尚需主动行为确认"
-                else:
-                    for en, zh in (
-                        ("absorption", "吸收"), ("accumulation", "吸筹"),
-                        ("distribution", "派发"), ("buy", "买方"), ("sell", "卖方"),
-                    ):
-                        note = note.replace(en, zh)
-                p.append(f"<p style='margin:2px 0;color:#8b949e'>· {note}</p>")
-
-        # ── 底部：行情概率总结（基于本页盘面结论的确定性测算，红色加粗）────
-        prob = self._compute_probabilities(wa)
-        p.append(
-            "<p style='margin:10px 0 2px;border-top:1px solid #2a3442;padding-top:8px'>"
-            "<b style='color:#ef4444;font-size:14px'>"
-            f"当前盘面综合研判：空头行情概率 {prob['short']}%，多头行情概率 {prob['long']}%，震荡观望概率 {prob['neutral']}%"
-            "</b></p>"
-        )
-
-        p.append("</div>")
-        return "".join(p)
+    def _populate_data_table(self, frame) -> None:
+        """兼容方法：填充 K 线明细表格（委托子控件）。"""
+        self._tab_data.populate(frame)
 
     def _render_ai_tab(self, res, wa) -> str:
         """问AI标签页：AI 分析结论 + 概率 + 思考过程 + Token 统计。
@@ -1433,7 +1126,6 @@ class MainWindow(QMainWindow):
     def _on_auto_toggle(self, checked: bool) -> None:
         self._auto_active = checked
         if checked:
-            # 开启时记录当前 bar 作为基准，避免立即重复分析
             symbol = self._sym_combo.currentText()
             timeframe = self._current_tf()
             ts = get_latest_bar_ts(symbol, timeframe)
@@ -1464,21 +1156,15 @@ class MainWindow(QMainWindow):
             self._update_kline_status()
 
     def _measure_server_offset(self) -> int:
-        """测量 MT5 服务器时钟与真实 UTC 的偏移（毫秒）。
-
-        MT5 返回的 bar time / tick time_msc 均基于服务器时钟（本机实测快 3 小时，
-        对应 GTC 服务器 GMT+3），而 time.time() 是真实 UTC——两者基准不同，
-        直接相减会导致倒计时偏差数小时。取最新 tick 的 time_msc 与本地 UTC 之差作为偏移。
-        """
+        """测量 MT5 服务器时钟与真实 UTC 的偏移（毫秒）。"""
         try:
             import MetaTrader5 as mt5
-            from wkf.data.mt5_source import resolve_mt5_symbol
+            from wkf.data.mt5_source import ensure_mt5_initialized, resolve_mt5_symbol
 
-            if not mt5.initialize():
+            if not ensure_mt5_initialized(mt5):
                 return 0
             sym = resolve_mt5_symbol(self._sym_combo.currentText())
             now = int(time.time())
-            # 范围覆盖服务器时钟（真实 UTC + 数小时），取最新 tick
             tks = mt5.copy_ticks_range(sym, now - 120, now + 4 * 3600, mt5.COPY_TICKS_ALL)
             if tks is not None and len(tks) > 0:
                 return int(tks[-1]["time_msc"] - now * 1000)
@@ -1496,17 +1182,10 @@ class MainWindow(QMainWindow):
             pass  # 时钟异常不影响主流程
 
     def _update_kline_status(self) -> None:
-        """K线收盘倒计时：1 秒定时器秒级实时刷新（修复原 5 秒刷新的滞后问题）。
-
-        实现：MT5 最新K线时间戳每 5 秒校准一次（避免每秒高频连接），
-        其余每秒用本地时间精确递减剩余收盘时间；
-        K线完结（时间戳变化）时自动以新K线起点重置倒计时。
-
-        关键修复：K线时间戳基于 MT5 服务器时钟（与本地 UTC 有数小时时区偏移），
-        必须先用服务器偏移对齐"当前时刻"，否则剩余时间偏差数小时
-        （如 10 分钟K线显示成 185 分钟）。
-        """
-        if self._analysis_busy:
+        """K线收盘倒计时：1 秒定时器秒级实时刷新（MT5 服务器时钟偏移对齐）。"""
+        # 【改动点】V1.3.3：切换/加载中不覆盖状态栏的加载提示文案
+        # （否则 1 秒定时器会用旧 K 线倒计时覆盖「品种数据加载中/周期重构渲染中」）。
+        if self._loading or self._switching or self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
         timeframe = self._current_tf()
@@ -1532,8 +1211,7 @@ class MainWindow(QMainWindow):
         if ts <= 0:
             return
         minutes = TF_MINUTES.get(timeframe, 15)
-        period_ms = minutes * 60 * 1000  # 单根K线周期（如 10m = 600 秒）
-        # 服务器时钟基准下的"当前时刻" = 真实 UTC + 服务器偏移
+        period_ms = minutes * 60 * 1000  # 单根K线周期
         server_now_ms = int(time.time() * 1000) + self._server_offset_ms
         remain_s = max(0, int((ts + period_ms - server_now_ms) // 1000))
         remain = f"{remain_s // 60}分{remain_s % 60}秒"

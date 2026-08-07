@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
+import bisect
 from typing import Any
 
 from wkf.data.base import (
@@ -37,6 +39,28 @@ TICK_SIZE_MAP: dict[str, float] = {
     "ES1!": 0.25,
     "GC1!": 0.1,
 }
+
+# MT5 终端常见安装路径（默认 IPC 发现失败时显式重试，兼容非标准启动方式）
+MT5_TERMINAL_PATHS = [
+    r"C:\Program Files\MetaTrader 5\terminal64.exe",
+    r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
+    r"D:\Program Files\MetaTrader 5\terminal64.exe",
+    r"E:\Program Files\MetaTrader 5\terminal64.exe",
+]
+
+
+def ensure_mt5_initialized(mt5_module) -> bool:
+    """初始化 MT5 连接：默认 IPC 失败时按常见安装路径显式重试。
+
+    【改动点】V1.3.2：实测本机 mt5.initialize() 返回 IPC initialize failed，
+    显式指定 terminal64.exe 路径后连接成功；统一封装后所有调用点共享该修复。
+    """
+    if mt5_module.initialize():
+        return True
+    for path in MT5_TERMINAL_PATHS:
+        if os.path.exists(path) and mt5_module.initialize(path):
+            return True
+    return False
 
 
 def mt5_timeframe(timeframe: str) -> int:
@@ -88,7 +112,7 @@ def fetch_mt5_bars(
     """
     import MetaTrader5 as mt5
 
-    if not mt5.initialize():
+    if not ensure_mt5_initialized(mt5):
         raise RuntimeError(f"MT5 初始化失败: {mt5.last_error()}")
 
     mt5_sym = resolve_mt5_symbol(symbol)
@@ -164,7 +188,12 @@ def _split_ticks_by_bar(
     ticks: list[Any],
     bars: list[KlineBar],
 ) -> list[list[Any]]:
-    """把 tick 按时间归属到各 bar（bars 新→旧）。"""
+    """把 tick 按时间归属到各 bar（bars 新→旧）。
+
+    【改动点】V1.3.2 性能优化：原实现为 O(ticks×bars) 线性扫描，
+    短周期大窗口（如 1m×2880 根）会退化到数亿次比较导致加载超时；
+    改为时间正序窗口 + 二分定位，复杂度 O(ticks×log(bars))。
+    """
     buckets: list[list[Any]] = [[] for _ in bars]
     if not ticks:
         return buckets
@@ -175,15 +204,19 @@ def _split_ticks_by_bar(
         start = b.ts_open
         end = bars[i - 1].ts_open if i > 0 else b.ts_open + 3600_000 * 10
         windows.append((start, end))
+    # 反转为时间正序（旧→新），供二分查找
+    windows.reverse()
+    starts = [w[0] for w in windows]
 
     for t in ticks:
         t_ms = t.time if t.time else 0
         if t_ms <= 0:
             continue
-        for i, (start, end) in enumerate(windows):
-            if start <= t_ms < end:
-                buckets[i].append(t)
-                break
+        # 二分定位最后一个 start <= t_ms 的窗口（时间正序索引 j）
+        j = bisect.bisect_right(starts, t_ms) - 1
+        if j >= 0 and t_ms < windows[j][1]:
+            # 正序窗口 j 对应新→旧 bars 中的索引 len(bars)-1-j
+            buckets[len(bars) - 1 - j].append(t)
     return buckets
 
 
@@ -217,7 +250,7 @@ def enrich_frame_with_orderflow(
 
             from wkf.data.mt5_tick_bridge import fetch_ticks_for_range
 
-            if not mt5.initialize():
+            if not ensure_mt5_initialized(mt5):
                 return frame
             try:
                 newest_ts = bars[0].ts_open

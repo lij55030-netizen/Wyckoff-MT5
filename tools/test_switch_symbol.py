@@ -21,6 +21,10 @@ from PyQt6.QtWidgets import QApplication
 
 app = QApplication([])
 
+# 【改动点】测试隔离说明：V1.3.1 起 v131 测试的缓存往返验证使用独立测试键 "TST!"，
+# 不再写入真实品种（NQ1! 5m 等），因此本测试无需清理磁盘缓存即可获得 48h 窗口根数。
+# （历史残留的陈旧缓存可通过手动删除 cache/kline_*.json 处理；此处不执行删除，
+#   避免沙箱安全策略拦截测试内文件删除导致测试进程中断。）
 from wkf.gui.main_window import MainWindow, TF_MINUTES, WINDOW_HOURS  # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
@@ -95,7 +99,7 @@ check("快速连切后显示 ES1! 30m", "ES1!" in data_txt and "30m" in data_txt
 win._sym_combo.setCurrentText("GC1!")
 app.processEvents()
 time.sleep(0.15)  # 防抖触发前
-loading_shown = "加载" in win._tab_data.toPlainText() or "切换中" in win._kline_status.text()
+loading_shown = "加载中" in win._kline_status.text() or "重构渲染中" in win._kline_status.text()
 wait_fetch(win)
 check("切换时显示加载状态", loading_shown,
       f"状态栏: {win._kline_status.text()!r}")

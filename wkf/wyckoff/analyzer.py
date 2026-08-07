@@ -1,4 +1,8 @@
-"""威科夫综合分析：三层合一，输出可注入 Prompt 的诊断。"""
+"""威科夫综合分析：三层合一，输出可注入 Prompt 的诊断。
+
+【风险提示】订单流由 MT5 Tick 数据近似换算生成，并非交易所原始盘口订单流，
+仅用于威科夫结构定性研判，不建议作为高频短线交易依据。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -187,6 +191,7 @@ def analyze(
                 footprint=fp0,
                 tick_size=tick_size,
                 thresholds=(footprint_threshold, footprint_threshold * 1.5, footprint_threshold * 2.0),
+                bars=bars,
             )
         else:
             # 完全无足迹：仅按 delta 序列验证
@@ -196,6 +201,7 @@ def analyze(
                 footprint=None,
                 tick_size=tick_size,
                 thresholds=(footprint_threshold, footprint_threshold * 1.5, footprint_threshold * 2.0),
+                bars=bars,
             )
     else:
         # OHLCV 近似

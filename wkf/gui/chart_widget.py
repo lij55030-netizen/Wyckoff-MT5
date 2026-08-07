@@ -70,6 +70,9 @@ class WkfChart(QWidget):
         # 【涉及文件】wkf/gui/chart_widget.py（对应假设文件 kline_chart.py）
         # 【验证方式】滚轮上下滚动实现 K 线放大/缩小；左键按住横向拖动平移图表
         self._plot.setMouseEnabled(x=True, y=True)
+        # 矩形框选放大：ViewBox 原生支持——右键拖拽拉出选区即局部放大
+        # （左键=平移，滚轮=缩放，右键=框选放大，三键互不冲突）。
+        self._plot.getPlotItem().vb.setMouseMode(pg.ViewBox.PanMode)
         layout.addWidget(self._plot)
 
         # RSI 子图（同样开启交互）
@@ -85,6 +88,7 @@ class WkfChart(QWidget):
         # set_frame 刷新时若用户已手动调整视图，则不再强制 autoRange 重置，保留视图位置。
         self._user_viewed = False
         self._last_symbol: str | None = None
+        self._last_key: tuple | None = None  # (symbol, timeframe)：任一变化重置视图
         self._plot.getPlotItem().vb.sigRangeChangedManually.connect(
             lambda *_: setattr(self, "_user_viewed", True)
         )
@@ -154,6 +158,7 @@ class WkfChart(QWidget):
         self._plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
 
     def clear_items(self) -> None:
+        """清空主图 K线/指标/VA/POC 数据层（overlay 覆盖层独立保留，Z 层级不变）。"""
         for it in self._items:
             try:
                 self._plot.removeItem(it)
@@ -162,7 +167,52 @@ class WkfChart(QWidget):
         self._items = []
 
     def clear_rsi(self) -> None:
-        self._rsi_plot.clear()
+        """清空 RSI 副图数据层，保留十字线 RSI 同步线（overlay）。"""
+        for it in list(self._rsi_plot.items()):
+            if it is not self._ch_rsi_vline:
+                try:
+                    self._rsi_plot.removeItem(it)
+                except Exception:
+                    pass
+
+    def reset_view_state(self, symbol: str) -> None:
+        """切换品种/周期前置：重置用户视图标记与旧数据帧，新数据强制 autoRange 适配。"""
+        self._last_symbol = symbol
+        self._last_key = None
+        self._user_viewed = False
+        self._frame = None  # 旧数据帧失效（十字线吸附/实时价格线基准一并重置）
+
+    def reset_view(self) -> None:
+        """空格键快捷键：重置图表为完整视图（主图 + RSI 全部 autoRange）。"""
+        self._user_viewed = False
+        self._plot.autoRange()
+        self._rsi_plot.autoRange()
+
+    # ── 加载挂起/恢复（品种/周期切换期间禁用交互，避免旧数据残留）──────
+    def suspend_interactions(self) -> None:
+        """切换加载前调用：隐藏全部覆盖层（价格线/十字线），挂起鼠标监听。"""
+        self._suspended = True
+        # 记录用户十字光标开关状态，加载完成后恢复
+        self._crosshair_state_before_suspend = self._crosshair_enabled
+        self._last_price_line.setVisible(False)
+        self._last_price_label.setVisible(False)
+        self._ch_vline.setVisible(False)
+        self._ch_hline.setVisible(False)
+        self._ch_label.setVisible(False)
+        self._ch_rsi_vline.setVisible(False)
+        self._cross_idx = -1
+
+    def resume_interactions(self) -> None:
+        """数据加载完成：恢复鼠标监听；若用户开启过十字光标则重新激活。"""
+        self._suspended = False
+        if getattr(self, "_crosshair_state_before_suspend", False):
+            self._crosshair_enabled = True
+            if self._frame is not None and self._mouse_scene_pos is not None:
+                vb = self._plot.getPlotItem().vb
+                if vb.sceneBoundingRect().contains(self._mouse_scene_pos):
+                    self._update_crosshair(self._mouse_scene_pos)
+        else:
+            self._crosshair_enabled = False
 
     def _render_candles(self, frame: KlineFrame, x: np.ndarray) -> None:
         bars = frame.bars
@@ -291,11 +341,13 @@ class WkfChart(QWidget):
         n = len(frame.bars)
         if n == 0:
             return
-        # 【改动点】需求3：切换品种时重置用户视图标记（新数据需重新自动适配）；
-        # 同品种刷新/用户已手动缩放平移时保持视图，不强制重置坐标轴。
+        # 【改动点】需求3/图表交互升级：品种或周期任一变化 → 重置用户视图标记，
+        # 新数据强制 autoRange；同品种同周期刷新/用户手动缩放平移时保持视图。
         # 【涉及文件】wkf/gui/chart_widget.py（对应假设文件 kline_chart.py）
-        # 【验证方式】手动缩放视图后刷新 K 线，视图不自动复位；切换品种后重新适配
-        if frame.symbol != self._last_symbol:
+        # 【验证方式】手动缩放视图后刷新 K 线，视图不自动复位；切换品种/周期后重新适配
+        key = (frame.symbol, frame.timeframe)
+        if key != self._last_key:
+            self._last_key = key
             self._last_symbol = frame.symbol
             self._user_viewed = False
         do_autorange = not self._user_viewed
@@ -348,6 +400,8 @@ class WkfChart(QWidget):
 
     def _on_scene_mouse_moved(self, scene_pos) -> None:
         """场景鼠标移动（每帧触发）：记录位置，判断是否在图表区域并刷新十字线。"""
+        if getattr(self, "_suspended", False):
+            return  # 加载挂起期间忽略鼠标监听（切换前置清理的一部分）
         self._mouse_scene_pos = scene_pos
         if not self._crosshair_enabled:
             return

@@ -190,6 +190,19 @@ class IndicatorDialog(_BaseDialog):
         idx = self._table_style.findData(g.table_style)
         self._table_style.setCurrentIndex(idx if idx >= 0 else 0)
 
+        # 【改动点】数据源切换开关（需求三）：MT5（完整功能）/ yfinance（可选，无Tick）
+        # 【涉及文件】wkf/gui/settings_dialogs.py + wkf/config/settings.py + wkf/data/datasource.py
+        # 【验证方式】切换到 yfinance 保存后，GUI 弹窗提示无Tick并隐藏订单流；MT5 恢复完整功能
+        self._data_source = QComboBox()
+        self._data_source.addItem("MT5（完整功能，含订单流）", "mt5")
+        self._data_source.addItem("yfinance（通用行情，无Tick数据）", "yfinance")
+        ds_idx = self._data_source.findData(getattr(g, "data_source", "mt5"))
+        self._data_source.setCurrentIndex(ds_idx if ds_idx >= 0 else 0)
+        self._data_source.setToolTip(
+            "MT5：完整启用全部功能（订单流/足迹图/实时价格线）。\n"
+            "yfinance：支持 BTC、美股指数等品种，无 Tick 数据，自动隐藏订单流面板。"
+        )
+
         self._form.addRow("K线数量:", self._bar_count)
         self._form.addRow("RSI 周期:", self._rsi_period)
         self._form.addRow("布林带周期:", self._bb_period)
@@ -200,12 +213,14 @@ class IndicatorDialog(_BaseDialog):
         self._form.addRow("足迹失衡倍数:", self._fp_threshold)
         self._form.addRow("摆动检测窗口:", self._swing_window)
         self._form.addRow("K线明细表格样式:", self._table_style)
+        self._form.addRow("行情数据源:", self._data_source)
 
     def _on_save(self) -> None:
         g = self._settings.general
         ind = self._settings.indicators
         g.analysis_bar_count = self._bar_count.value()
         g.table_style = self._table_style.currentData() or "new"
+        g.data_source = self._data_source.currentData() or "mt5"
         ind.rsi_period = self._rsi_period.value()
         ind.bollinger_period = self._bb_period.value()
         ind.bollinger_std = self._bb_std.value()

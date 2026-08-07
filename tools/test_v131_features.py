@@ -22,6 +22,16 @@ def chk(name, cond):
 s = load_settings()
 s.general.first_run = False
 from wkf.config.settings import save_settings
+
+# 【改动点】测试隔离：清空磁盘缓存后再测"缓存写入/命中"，避免残留缓存干扰断言。
+# 【涉及文件】tools/test_v131_features.py
+# 【验证方式】本测试独立/连带运行均通过；其他测试不再受本测试 60 根缓存影响
+try:
+    if cache_manager.CACHE_DIR.exists():
+        for _f in cache_manager.CACHE_DIR.glob("kline_*.json"):
+            _f.unlink(missing_ok=True)
+except Exception:
+    pass
 save_settings(s, r"E:\workbuddy\MT50802\wkf\config\settings.json")
 
 win = MainWindow()
@@ -74,9 +84,13 @@ if snapshots:
 from wkf.data.mt5_source import fetch_mt5_bars
 
 # 2a. 缓存写入/读取往返
+# 【改动点】测试隔离：缓存往返验证使用独立测试键 "TST!"（不污染真实品种 NQ1! 5m，
+# 否则后续 switch 测试期望 576 根会命中本测试写入的 60 根陈旧缓存）。
+# 【涉及文件】tools/test_v131_features.py
+# 【验证方式】v131 与 switch 任意顺序运行均通过
 bars = fetch_mt5_bars("NQ1!", "5m", 60)
-chk("缓存写入", cache_manager.disk_cache_put("NQ1!", "5m", bars))
-bars2 = cache_manager.disk_cache_get("NQ1!", "5m")
+chk("缓存写入", cache_manager.disk_cache_put("TST!", "5m", bars))
+bars2 = cache_manager.disk_cache_get("TST!", "5m")
 chk("缓存读取往返一致", bars2 is not None and len(bars2) == len(bars))
 if bars2:
     chk("缓存K线字段一致", abs(bars2[0].close - bars[0].close) < 1e-9)

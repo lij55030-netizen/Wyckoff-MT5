@@ -2,6 +2,8 @@
 REM ============================================================
 REM  WKF 威科夫交易智能体 — EXE 打包脚本
 REM  用法: 双击运行，或 build_exe.bat gui / cli / bot / all
+REM  V3.0: GUI 改为 onedir 目录分发（Wyckoff_Analysis_GUI.spec），
+REM        产物 dist\WKF\（主程序 + _internal 运行时），供 WKF_installer.iss 打包。
 REM  依赖: pip install pyinstaller
 REM ============================================================
 cd /d "%~dp0"
@@ -31,8 +33,8 @@ if "%MODE%"=="cli" goto do_cli
 if "%MODE%"=="bot" goto do_bot
 
 :do_gui
-echo [WKF] 打包 GUI 面板（无控制台窗口）...
-D:\python\python.exe -m PyInstaller -F -w -n Wyckoff_Analysis_GUI run.py
+echo [WKF] 打包 GUI 面板（onedir 目录分发，无控制台窗口）...
+D:\python\python.exe -m PyInstaller --noconfirm --clean Wyckoff_Analysis_GUI.spec
 goto done
 
 :do_cli

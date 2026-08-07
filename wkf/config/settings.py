@@ -42,6 +42,10 @@ class GeneralSettings(BaseModel):
     table_style: str = "new"
     # 首次启动标志：用于启动时弹窗引导基础配置（AI Key / 飞书 Webhook）
     first_run: bool = True
+    # 【改动点】数据源模式："mt5"（默认，完整功能含订单流）/ "yfinance"（可选，无Tick）
+    # 【涉及文件】wkf/config/settings.py + wkf/data/datasource.py
+    # 【验证方式】切到 yfinance 后 GUI 自动隐藏订单流面板并弹窗提示；mt5 恢复全部功能
+    data_source: str = "mt5"
 
 
 class IndicatorSettings(BaseModel):

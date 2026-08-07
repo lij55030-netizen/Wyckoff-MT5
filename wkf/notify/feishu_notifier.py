@@ -188,6 +188,10 @@ def push_analysis_notice(
     if of_text:
         rows.append([_t(of_text)])
     rows.append([_t("以上仅为分析参考，不构成投资建议。", "grey")])
+    # 【改动点】飞书推送固定附注订单流风险提示（与 GUI/HTML/文件头同文案）
+    # 【涉及文件】wkf/notify/feishu_notifier.py
+    # 【验证方式】分析完成推送的飞书消息末尾可见订单流 Tick 近似换算风险提示
+    rows.append([_t("⚠ 订单流由 MT5 Tick 数据近似换算生成，并非交易所原始盘口订单流，仅用于威科夫结构定性研判，不建议作为高频短线交易依据。", "grey")])
 
     payload: dict[str, Any] = {
         "msg_type": "post",

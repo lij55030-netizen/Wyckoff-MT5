@@ -1,14 +1,15 @@
 ; ============================================================
-; WKF 威科夫交易智能体 V2.4 — 一键安装包脚本
+; WKF 威科夫交易智能体 V3.0 — 一键安装包脚本（onedir 目录分发）
 ; 编译: ISCC.exe WKF_installer.iss
-; 产物: installer\WKF_V2.4_Setup.exe
+; 产物: installer\WKF_V3.0_Setup.exe
+; 支持: 自定义安装路径 / 桌面快捷方式(可选) / 开始菜单 / 内置卸载程序
 ; ============================================================
 #define MyAppName "WKF 威科夫交易智能体"
-#define MyAppVersion "2.4.0"
-#define MyAppExeName "Wyckoff_Analysis_GUI.exe"
+#define MyAppVersion "3.0.0"
+#define MyAppExeName "WKF.exe"
 
 [Setup]
-AppId={{8E5C2F1A-7B3D-4E2A-9C4F-1D2B3C4D5E6F}
+AppId={{A3F7D9B2-4E6C-4B8A-9D1E-5F2C8A0B7E93}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=WKF Team
@@ -20,7 +21,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 OutputDir=installer
-OutputBaseFilename=WKF_V1.3.0_Setup
+OutputBaseFilename=WKF_V3.0_Setup
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -31,17 +32,16 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Name: "startmenu"; Description: "创建开始菜单入口"; GroupDescription: "附加任务:"
 
 [Files]
-; 三个主程序（PyInstaller 单文件，内嵌 Python 解释器）
-Source: "dist\Wyckoff_Analysis_GUI.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\Wyckoff_CLI.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\Wyckoff_Feishu_Bot.exe"; DestDir: "{app}"; Flags: ignoreversion
+; 主程序 onedir 目录（PyInstaller 打包产物，含 _internal 运行时依赖）
+Source: "dist\WKF\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 新手使用手册与快捷启动
 Source: "WKF使用手册.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "启动GUI.bat"; DestDir: "{app}"; Flags: ignoreversion
-Source: "启动CLI.bat"; DestDir: "{app}"; Flags: ignoreversion
-Source: "启动飞书机器人.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "绿色免安装版说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; 配置模板（不含任何真实密钥，首次启动弹窗引导配置）
-Source: "config\config.ini.example"; DestDir: "{app}\config"; Flags: ignoreversion
+; 运行时配置路径基于 _internal（onedir 打包后 wkf/config/settings.py 位于 _internal\wkf\config），
+; 首次启动自动创建 settings.json；模板与运行时路径保持一致。
+Source: "config\config.ini.example"; DestDir: "{app}\_internal\config"; Flags: ignoreversion
 
 [Icons]
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
@@ -54,6 +54,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Fla
 
 ; 卸载清理：配置文件、报告/日志/快照缓存，确保无残留
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}\config"
-Type: filesandordirs; Name: "{app}\output"
-Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\_internal\config"
+Type: filesandordirs; Name: "{app}\_internal\output"
+Type: filesandordirs; Name: "{app}\_internal\logs"
+Type: filesandordirs; Name: "{app}\_internal\cache"
+Type: filesandordirs; Name: "{app}\_internal\prompt_engineering"

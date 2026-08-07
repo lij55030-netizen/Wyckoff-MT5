@@ -21,6 +21,29 @@ from wkf.wyckoff.analyzer import WyckoffAnalysis, analyze
 logger = logging.getLogger(__name__)
 
 
+def _fetch_bars_via_source(symbol: str, timeframe: str, bar_count: int, settings: Settings | None) -> list:
+    """按数据源模式拉取 K 线（需求三：yfinance 可选数据源）。
+
+    【改动点】取数统一走 wkf.data.datasource.get_data_source()：
+      · data_source=mt5（默认）→ 走既有 fetch_mt5_bars（完整功能）；
+      · data_source=yfinance → 走 YfinanceSource（无Tick，上层逻辑不变）。
+    【涉及文件】wkf/orchestrator/runner.py + wkf/data/datasource.py
+    【验证方式】data_source=mt5 行为与旧版完全一致（e2e 40/40）；
+                yfinance 模式返回的 KlineBar 列表结构一致。
+    """
+    from wkf.data.datasource import DS_MT5, get_data_source
+
+    mode = None
+    try:
+        mode = settings.general.data_source if settings is not None else None
+    except Exception:
+        mode = None
+    if mode == DS_MT5 or mode is None:
+        return fetch_mt5_bars(symbol, timeframe, bar_count)
+    src = get_data_source(mode)
+    return src.fetch_bars(symbol, timeframe, bar_count)
+
+
 @dataclass
 class AnalysisResult:
     symbol: str
@@ -77,10 +100,10 @@ def run_analysis(
 
     try:
         # 1. 数据
-        bars = fetch_mt5_bars(symbol, timeframe, bar_count)
-        res.steps.append("MT5 K线获取")
+        bars = _fetch_bars_via_source(symbol, timeframe, bar_count, settings)
+        res.steps.append("行情K线获取")
         if not bars:
-            res.error = "MT5 返回空 K 线数据"
+            res.error = "数据源返回空 K 线数据"
             return res
 
         # 2. 指标（参数来自设置，可配置）
@@ -196,9 +219,9 @@ def fetch_frame_only(
 
     settings = settings or load_settings()
     try:
-        bars = fetch_mt5_bars(symbol, timeframe, bar_count)
+        bars = _fetch_bars_via_source(symbol, timeframe, bar_count, settings)
         if not bars:
-            return None, None, "MT5 返回空 K 线数据"
+            return None, None, "数据源返回空 K 线数据"
         frame, wa = _build_frame(symbol, timeframe, bars, settings)
         return frame, wa, ""
     except Exception as exc:
@@ -232,14 +255,14 @@ def fetch_frame_cached(
         if use_disk_cache:
             bars = disk_cache_get(symbol, timeframe)
             if bars:
-                # 磁盘命中：跳过 MT5 与 tick 拉取，秒级出图
+                # 磁盘命中：跳过数据源与 tick 拉取，秒级出图
                 frame, wa = _build_frame(
                     symbol, timeframe, bars, settings, fetch_ticks=False
                 )
                 return frame, wa, "", True
-        bars = fetch_mt5_bars(symbol, timeframe, bar_count)
+        bars = _fetch_bars_via_source(symbol, timeframe, bar_count, settings)
         if not bars:
-            return None, None, "MT5 返回空 K 线数据", False
+            return None, None, "数据源返回空 K 线数据", False
         frame, wa = _build_frame(symbol, timeframe, bars, settings)
         if use_disk_cache:
             disk_cache_put(symbol, timeframe, bars)
@@ -255,7 +278,7 @@ def get_latest_bar_ts(symbol: str, timeframe: str) -> int:
     返回 -1 表示获取失败。
     """
     try:
-        bars = fetch_mt5_bars(symbol, timeframe, 2)
+        bars = _fetch_bars_via_source(symbol, timeframe, 2, None)
         if bars:
             return bars[0].ts_open
         return -1

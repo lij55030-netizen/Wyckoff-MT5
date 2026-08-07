@@ -5,11 +5,14 @@ __pycache__/
 .eggs/
 build/
 dist/
+installer/
+dist_archive/
 .venv/
 venv/
 
-# PyInstaller
-*.spec
+# PyInstaller 中间产物（根目录 spec 打包配置需提交，不忽略）
+build/*.toc
+*.pyz
 
 # Config (contains API keys — never commit)
 config/settings.json
@@ -22,6 +25,9 @@ output/
 records/
 trade_records/
 logs/
+cache/
+resp*.json
+gui_diag.log
 
 # IDE
 .idea/
