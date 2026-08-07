@@ -8,6 +8,9 @@ dist/
 .venv/
 venv/
 
+# PyInstaller
+*.spec
+
 # Config (contains API keys — never commit)
 config/settings.json
 *.example.json
