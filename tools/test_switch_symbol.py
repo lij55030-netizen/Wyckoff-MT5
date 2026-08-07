@@ -57,7 +57,7 @@ print("=" * 60)
 sequence = [("ES1!", "15m"), ("GC1!", "30m"), ("NQ1!", "5m"), ("ES1!", "1h")]
 for sym, tf in sequence:
     win._sym_combo.setCurrentText(sym)
-    win._tf_combo.setCurrentText(tf)
+    win._tf_combo.setCurrentIndex(win._tf_combo.findData(tf))
     app.processEvents()
     # 防抖定时器触发后 fetch
     wait_fetch(win)
@@ -77,11 +77,11 @@ print("=" * 60)
 print("测试2: 快速连切 GC→NQ→ES（不等待，验证最终显示 ES）")
 print("=" * 60)
 win._sym_combo.setCurrentText("GC1!")
-win._tf_combo.setCurrentText("5m")
+win._tf_combo.setCurrentIndex(win._tf_combo.findData("5m"))
 win._sym_combo.setCurrentText("NQ1!")
-win._tf_combo.setCurrentText("15m")
+win._tf_combo.setCurrentIndex(win._tf_combo.findData("15m"))
 win._sym_combo.setCurrentText("ES1!")
-win._tf_combo.setCurrentText("30m")
+win._tf_combo.setCurrentIndex(win._tf_combo.findData("30m"))
 app.processEvents()
 time.sleep(1.5)  # 防抖 300ms + fetch 时间
 wait_fetch(win)
@@ -105,7 +105,7 @@ print()
 print("=" * 60)
 print("测试4: 异常处理（直接调用 fetch 传无效周期）")
 print("=" * 60)
-win._tf_combo.setCurrentText("1h")  # 正常
+win._tf_combo.setCurrentIndex(win._tf_combo.findData("1h"))  # 正常
 # 用 monkeypatch 模拟失败
 from wkf.gui import main_window as mw  # noqa: E402
 orig_fetch = mw.fetch_frame_only

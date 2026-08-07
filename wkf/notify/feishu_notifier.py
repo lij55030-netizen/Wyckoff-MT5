@@ -50,7 +50,7 @@ def _log_push(symbol: str, ok: bool, detail: str = "") -> None:
 def _send_payload(payload: dict, cfg: dict) -> bool:
     """发送 payload 到飞书 webhook（统一签名/异常/日志处理）。"""
     webhook = (cfg.get("webhook_url") or "").strip()
-    if not webhook or webhook.endswith("__需要用户"):
+    if not webhook or "__需要用户" in webhook:
         logger.warning("飞书 webhook_url 未配置或不完整")
         return False
     try:

@@ -40,18 +40,26 @@ TICK_SIZE_MAP: dict[str, float] = {
 
 
 def mt5_timeframe(timeframe: str) -> int:
-    """返回 MT5 TIMEFRAME 常量。"""
+    """返回 MT5 TIMEFRAME 常量。
+
+    【改动点】周期映射表扩展：新增 3m / 2h(120分) / 1w(周线)，日线 1d 复用。
+    【涉及文件】wkf/data/mt5_source.py（对应假设文件 data_fetcher.py 的取数层）
+    【验证方式】cli.py XAU 3m / XAU 2h / XAU 1d / XAU 1w 均可拉取对应级别K线
+    """
     import MetaTrader5 as mt5
 
     table = {
         "1m": mt5.TIMEFRAME_M1,
+        "3m": mt5.TIMEFRAME_M3,
         "5m": mt5.TIMEFRAME_M5,
         "10m": mt5.TIMEFRAME_M10,
         "15m": mt5.TIMEFRAME_M15,
         "30m": mt5.TIMEFRAME_M30,
         "1h": mt5.TIMEFRAME_H1,
+        "2h": mt5.TIMEFRAME_H2,
         "4h": mt5.TIMEFRAME_H4,
         "1d": mt5.TIMEFRAME_D1,
+        "1w": mt5.TIMEFRAME_W1,
     }
     return table.get(timeframe, mt5.TIMEFRAME_M15)
 

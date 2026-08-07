@@ -34,9 +34,10 @@ from PyQt6.QtWidgets import (
 
 from wkf.config.settings import load_settings
 from wkf.data.base import KlineFrame
+from wkf.data.mt5_source import resolve_mt5_symbol
 from wkf.gui.chart_widget import WkfChart
 from wkf.gui.settings_dialogs import AIModelDialog, FeishuDialog, IndicatorDialog
-from wkf.data.mt5_source import resolve_mt5_symbol
+from wkf.util.timefmt import beijing_now_str
 from wkf.orchestrator.runner import (
     AnalysisResult,
     fetch_frame_only,
@@ -45,10 +46,30 @@ from wkf.orchestrator.runner import (
 )
 
 SYMBOLS = ["NQ1!", "ES1!", "GC1!"]
-TIMEFRAMES = ["5m", "10m", "15m", "30m", "1h"]
-TF_MINUTES = {"5m": 5, "10m": 10, "15m": 15, "30m": 30, "1h": 60}
-# 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口）
+# 【改动点】周期下拉选项扩容 + 固定排序（短线→长线）。
+# 显示文本（中文）与内部键（供接口/存储使用）分离：下拉显示"1分"等，
+# itemData 存内部键（1m/3m/.../1w），下游全部使用内部键，互不干扰。
+# 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py / config_const.py）
+# 【验证方式】打开周期下拉，顺序严格为 1分→3分→5分→10分→15分→30分→60分→120分→240分→日线→周线；
+#             选中日线/周线可正常拉取对应级别K线。
+TIMEFRAME_ITEMS = [
+    ("1分", "1m"), ("3分", "3m"), ("5分", "5m"), ("10分", "10m"),
+    ("15分", "15m"), ("30分", "30m"), ("60分", "1h"),
+    ("120分", "2h"), ("240分", "4h"), ("日线", "1d"), ("周线", "1w"),
+]
+TIMEFRAMES = [key for _, key in TIMEFRAME_ITEMS]  # 内部键列表（兼容既有代码）
+# 【改动点】周期→分钟映射：日线=1440分钟、周线=10080分钟（用于接口请求参数转换）
+# 【验证方式】_window_bar_count / TF_MINUTES 查询：1d=1440、1w=10080
+TF_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "1d": 1440, "1w": 10080,
+}
+# 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口；日线/周线单独指定根数）
 WINDOW_HOURS = 48
+# 【改动点】④K线内存缓存有效期（秒）：短周期重复切换命中缓存直接渲染，无需重请求
+# 【涉及文件】wkf/gui/main_window.py（对应 data_fetcher.py）
+# 【验证方式】同品种往返切换第二次起毫秒级响应
+CACHE_TTL_S = 60
 
 
 class _KlineTableWidget(QWidget):
@@ -256,9 +277,26 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self._sym_combo)
 
         ctrl.addWidget(QLabel("周期:"))
+        # 【改动点】周期下拉：显示中文文本(1分…日线/周线)，itemData 存内部键；
+        #           开启自适应宽度（AdjustToContents），窗口缩放/高分屏/小窗口不截断。
+        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
+        # 【验证方式】拖动窗口放大缩小，打开周期下拉无文字截断；切换1分/日线/周线均可加载图表。
         self._tf_combo = QComboBox()
-        self._tf_combo.addItems(TIMEFRAMES)
-        self._tf_combo.setCurrentText("15m")
+        self._tf_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        for label, key in TIMEFRAME_ITEMS:
+            self._tf_combo.addItem(label, key)
+        # 【改动点】默认配置恢复：读取 settings 中的 last_symbol/last_timeframe，
+        #           默认品种 XAU/USD(GC1!)、默认周期 5 分钟。
+        # 【涉及文件】wkf/gui/main_window.py + wkf/config/settings.py（对应 config_manager.py）
+        # 【验证方式】首次启动品种=GC1!(XAU)、周期=5分；重启后记忆保留。
+        init_sym = getattr(self._settings.general, "last_symbol", "GC1!") or "GC1!"
+        init_tf = getattr(self._settings.general, "last_timeframe", "5m") or "5m"
+        if init_sym in SYMBOLS:
+            self._sym_combo.setCurrentText(init_sym)
+        idx = self._tf_combo.findData(init_tf)
+        self._tf_combo.setCurrentIndex(idx if idx >= 0 else 0)
         ctrl.addWidget(self._tf_combo)
 
         # 品种/周期变更 → 自动刷新图表（带 300ms 防抖，快速连续切换只发最后一次请求）
@@ -299,6 +337,18 @@ class MainWindow(QMainWindow):
         self._kline_status = QLabel("K线: --")
         self._kline_status.setStyleSheet("color:#8b949e;font-size:12px")
         ctrl.addWidget(self._kline_status)
+
+        # 【改动点】顶部状态栏新增常驻北京时间时钟控件（HH:MM:SS，独立 1 秒定时器刷新）。
+        # 与决策面板分析时间共用 beijing_now 时间源，时区强制 Asia/Shanghai。
+        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
+        # 【验证方式】修改系统时区为欧美时区，顶部依旧显示北京时间并每秒走动
+        self._clock_label = QLabel("🕐 --:--:--")
+        self._clock_label.setStyleSheet(
+            "color:#f59e0b;font-size:12px;font-weight:bold;padding:0 6px;"
+            "border:1px solid #2a3442;border-radius:4px;background:#161d26;"
+        )
+        self._clock_label.setToolTip("当前北京时间（东八区）")
+        ctrl.addWidget(self._clock_label)
         ctrl.addStretch(1)
         root.addLayout(ctrl)
 
@@ -352,6 +402,21 @@ class MainWindow(QMainWindow):
         self._tab_ai.send_btn.clicked.connect(self._on_ai_send)
         tabs.addTab(self._tab_ai, "🤖 问AI")
 
+        # 【改动点】Tab 栏右侧新增静态邮箱标签（禁止下拉菜单，控件选型为 QLabel；
+        #           开启文本可选中复制）。位于「问AI」标签右侧。
+        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 ui_main.py）
+        # 【验证方式】问AI标签右侧可见邮箱文本，鼠标可选中复制
+        from PyQt6.QtWidgets import QLabel as _QL
+
+        self._contact_label = _QL("　技术对接：lij55030@gmail.com")
+        self._contact_label.setStyleSheet(
+            "color:#8b949e;font-size:12px;padding:0 8px;background:transparent;"
+        )
+        self._contact_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        tabs.setCornerWidget(self._contact_label, Qt.Corner.TopRightCorner)
+
         result_split.addWidget(tabs)
         result_split.setSizes([170, 630])
 
@@ -369,6 +434,8 @@ class MainWindow(QMainWindow):
         self._history_count = 0
         self._has_ai_result = False
         self._analysis_time = ""  # 本次分析时间（年月日时分秒），决策面板/历史/飞书统一使用
+        # 【改动点】④K线内存缓存字典：key=(品种,周期) value=(monotonic, frame, wyckoff)
+        self._frame_cache: dict[tuple, tuple] = {}
         # 问AI对话状态
         self._ai_busy = False
         self._ai_reply.connect(self._on_ai_reply)
@@ -390,6 +457,11 @@ class MainWindow(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_kline_status)
         self._status_timer.start(1000)  # 1 秒定时器：秒级实时倒计时
+        # 【改动点】顶部北京时钟：独立 1 秒定时器刷新（不受倒计时 early-return 影响）
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
+        self._update_clock()
 
         # ── 实时价格标注：每 2 秒后台轮询 MT5 最新 tick 价，更新图表红线 ──
         self._tick_updated.connect(self._on_tick_updated)
@@ -465,11 +537,25 @@ class MainWindow(QMainWindow):
 
     # ── 48 小时时间级别：按周期换算需要拉取的K线根数 ─────────────────────
     def _window_bar_count(self, timeframe: str) -> int:
-        """返回 48 小时窗口对应的K线根数（含用户自定义根数下限）。"""
+        """返回 48 小时窗口对应的K线根数（含用户自定义根数下限）。
+
+        【改动点】日线/周线不再套用 48 小时换算（会退化为 2 根/0 根），
+        单独指定根数：日线 60 根、周线 30 根；其余周期保持 48 小时窗口。
+        【涉及文件】wkf/gui/main_window.py
+        【验证方式】选择日线图表约 60 根、周线约 30 根，5分=576 根（48h）。
+        """
+        if timeframe == "1d":
+            return 60
+        if timeframe == "1w":
+            return 30
         minutes = TF_MINUTES.get(timeframe, 15)
         base = WINDOW_HOURS * 60 // minutes  # 48h 对应根数
         # 若用户在「其他设置」调大了K线数量则尊重用户配置（显示更多）
         return max(base, getattr(self._settings.general, "analysis_bar_count", 48))
+
+    def _current_tf(self) -> str:
+        """返回当前选中的周期内部键（下拉显示中文文本，itemData 存内部键）。"""
+        return self._tf_combo.currentData() or TIMEFRAMES[0]
 
     # ── 十字光标工具：按钮开关（独立功能，不干扰拖拽/缩放/点击）───────────
     def _on_crosshair_toggle(self, checked: bool) -> None:
@@ -494,7 +580,7 @@ class MainWindow(QMainWindow):
         if not self._chart._frame:  # 图表尚未加载数据则跳过，减少空转
             return
         symbol = self._sym_combo.currentText()
-        timeframe = self._tf_combo.currentText()
+        timeframe = self._current_tf()
         sym, tf = symbol, timeframe
 
         def _work() -> None:
@@ -524,9 +610,48 @@ class MainWindow(QMainWindow):
         self._chart.set_last_price(price)
 
     def _on_selector_changed(self) -> None:
-        """品种/周期变更：显示加载状态并防抖触发刷新。"""
+        """品种/周期变更：周期记忆持久化 + 显示加载状态并防抖触发刷新。
+
+        【改动点】「品种-周期」独立记忆（settings.general.per_symbol_timeframe）：
+          · 品种切换：保存旧品种当前周期 → 恢复目标品种上次选用的周期（blockSignals 防递归）；
+          · 周期切换：立即把新周期写入当前品种记忆并落盘；
+          重启后记忆不丢失。
+        【涉及文件】wkf/gui/main_window.py（对应 config_manager.py 的读写）
+        【验证方式】GC1! 选 30分 → 切 NQ1! 选 5分 → 切回 GC1! 自动恢复 30分；
+                    关闭软件重启，品种与周期记忆保留。
+        """
+        g = self._settings.general
+        prev_sym = g.last_symbol
+        prev_tf = g.last_timeframe
         sym = self._sym_combo.currentText()
-        tf = self._tf_combo.currentText()
+        tf = self._current_tf()
+
+        if sym != prev_sym:
+            # 品种切换：保存旧品种周期记忆，恢复目标品种上次选用的周期
+            if prev_sym and prev_tf and prev_sym in SYMBOLS:
+                g.per_symbol_timeframe[prev_sym] = prev_tf
+            saved = g.per_symbol_timeframe.get(sym)
+            if saved and saved != tf:
+                self._tf_combo.blockSignals(True)
+                idx = self._tf_combo.findData(saved)
+                if idx >= 0:
+                    self._tf_combo.setCurrentIndex(idx)
+                self._tf_combo.blockSignals(False)
+                tf = saved
+        else:
+            # 周期切换：立即把新周期写入当前品种记忆
+            g.per_symbol_timeframe[sym] = tf
+
+        if sym != prev_sym or tf != prev_tf:
+            g.last_symbol = sym
+            g.last_timeframe = tf
+            try:
+                from wkf.config.settings import save_settings, SETTINGS_JSON_PATH
+
+                save_settings(self._settings, SETTINGS_JSON_PATH)
+            except Exception:
+                pass
+
         self._has_ai_result = False  # 新品种数据，旧 AI 结果作废
         self._kline_status.setText(f"⏳ 切换中，加载 {sym} {tf} ...")
         self._set_table_status(f"⏳ 正在加载 {sym} {tf}（48小时窗口）...")
@@ -585,7 +710,7 @@ class MainWindow(QMainWindow):
     # ── 获取数据（不跑 AI，快速刷新图表）─────────────────────────────────
     def _on_fetch_data(self) -> None:
         symbol = self._sym_combo.currentText()
-        timeframe = self._tf_combo.currentText()
+        timeframe = self._current_tf()
         self._fetch_req = (symbol, timeframe)  # 记录请求令牌
         self._fetch_btn.setEnabled(False)
         bar_count = self._window_bar_count(timeframe)
@@ -593,10 +718,24 @@ class MainWindow(QMainWindow):
             f"⏳ 获取 {symbol} {timeframe} 数据（{WINDOW_HOURS}h 窗口，{bar_count} 根）..."
         )
 
+        # 【改动点】④K线内存缓存：同一(品种,周期) 60 秒内重复切换命中缓存，
+        # 直接渲染无需重新拉取（MT5 拉取为耗时主因）。首次拉取仍走网络。
+        # 【涉及文件】wkf/gui/main_window.py（对应 data_fetcher.py 缓存层）
+        # 【验证方式】同品种往返快速切换：第二次起加载耗时显著下降（命中缓存≈毫秒级）
+        key = (symbol, timeframe)
+        hit = self._frame_cache.get(key)
+        if hit is not None and time.monotonic() - hit[0] < CACHE_TTL_S:
+            frame, wa = hit[1], hit[2]
+            self._fetch_btn.setEnabled(True)
+            self._fetch_done.emit(frame, wa, "")
+            return
+
         def _work() -> None:
             frame, wa, err = fetch_frame_only(
                 symbol, timeframe, bar_count=bar_count, settings=self._settings
             )
+            if frame is not None and not err:
+                self._frame_cache[key] = (time.monotonic(), frame, wa)
             self._fetch_done.emit(frame, wa, err)
 
         threading.Thread(target=_work, name="wkf-fetch", daemon=True).start()
@@ -605,7 +744,7 @@ class MainWindow(QMainWindow):
         """获取数据完成（主线程）。"""
         self._fetch_btn.setEnabled(True)
         # 防竞态：用户已切换品种/周期则丢弃过期响应
-        if self._fetch_req != (self._sym_combo.currentText(), self._tf_combo.currentText()):
+        if self._fetch_req != (self._sym_combo.currentText(), self._current_tf()):
             return
         if err:
             self._set_table_status(f"❌ 获取失败: {err}")
@@ -628,7 +767,7 @@ class MainWindow(QMainWindow):
 
     def _on_analyze(self) -> None:
         symbol = self._sym_combo.currentText()
-        timeframe = self._tf_combo.currentText()
+        timeframe = self._current_tf()
         self._fetch_req = (symbol, timeframe)  # 分析同样更新令牌
         self._analyze_btn.setEnabled(False)
         bar_count = self._window_bar_count(timeframe)
@@ -650,7 +789,7 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setEnabled(True)
         self._analysis_busy = False
         # 防竞态：分析期间用户切了品种/周期 → 丢弃过期结果
-        if self._fetch_req != (self._sym_combo.currentText(), self._tf_combo.currentText()):
+        if self._fetch_req != (self._sym_combo.currentText(), self._current_tf()):
             return
         self._has_ai_result = True
         if res.error:
@@ -664,13 +803,32 @@ class MainWindow(QMainWindow):
         self._last_frame = res.frame
         self._last_wa = res.wyckoff
         self._last_res = res
-        # 本次分析时间（本地时间，年月日时分秒）：决策面板/历史记录/飞书推送统一使用
-        self._analysis_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 本次分析时间：强制北京时间（Asia/Shanghai，与顶部时钟同一时间源）；
+        # 决策面板/历史记录/飞书推送统一使用该时间戳。
+        # 【改动点】datetime.now() → beijing_now_str()（时区锁定东八区）
+        # 【涉及文件】wkf/gui/main_window.py + wkf/util/timefmt.py
+        # 【验证方式】系统时区改为欧美时区后，决策面板分析时间仍为北京时间
+        self._analysis_time = beijing_now_str()
         # 填充 5 个标签页
         self._populate_tabs(res.frame, res.wyckoff, res)
         # 历史记录（使用同一分析时间戳）
         bias = res.wyckoff.bias if res.wyckoff is not None else ""
         self._append_history(res.symbol, res.timeframe, bias, res.to_report(), self._analysis_time)
+        # 【改动点】高概率行情提示音：综合概率（多/空取大值）> 60% 播放单次提示音。
+        # 防抖约束：单轮分析仅触发 1 次，30 秒内同品种不重复响铃（audio_player 内处理）；
+        # 无音频文件则静默不报错。注意与飞书 66.5% 高亮阈值区分：
+        #   60% = 本地铃声预警；66.5% = 飞书重点消息推送，两处独立。
+        # 【涉及文件】wkf/gui/main_window.py + wkf/util/audio_player.py
+        # 【验证方式】构造 62% 概率分析听到提示音；30 秒内同品种再分析无二次铃声
+        if res.wyckoff is not None:
+            try:
+                prob = self._compute_probabilities(res.wyckoff)
+                if max(prob.get("long", 0), prob.get("short", 0)) > 60:
+                    from wkf.util.audio_player import play_alert
+
+                    play_alert(res.symbol)
+            except Exception:
+                pass
         # 飞书推送：仅分析完成触发；防抖/高亮/日志均在 notifier 内处理（后台线程不阻塞 UI）
         self._spawn_feishu_push(res, bias)
 
@@ -688,7 +846,9 @@ class MainWindow(QMainWindow):
             of = wa.orderflow
             va_text = f"价值区域：VA [{va.val:.2f}, {va.vah:.2f}] VPOC {va.vpoc:.2f}" if va else ""
             of_text = (
-                f"订单流：Delta {of.delta:+.0f} 活跃方 {of.active_side} 阶段 {of.reversal_stage}"
+                f"订单流：Delta {of.delta:+.0f} 活跃方 "
+                f"{'买方' if str(of.active_side).lower() == 'buy' else ('卖方' if str(of.active_side).lower() == 'sell' else of.active_side)}"
+                f" 阶段 {'吸收' if str(of.reversal_stage).lower() == 'absorption' else of.reversal_stage}"
                 if of else ""
             )
             symbol, timeframe = res.symbol, res.timeframe
@@ -970,8 +1130,8 @@ class MainWindow(QMainWindow):
 
         p = []
         p.append("<div style='font-size:13px;line-height:1.8'>")
-        # 本次分析时间（点击提交分析时的本地时间，重新分析自动刷新）
-        atime = getattr(self, "_analysis_time", "") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 本次分析时间（北京时间，与顶部时钟同一时间源；重新分析自动刷新）
+        atime = getattr(self, "_analysis_time", "") or beijing_now_str()
         p.append(
             f"<p style='margin:0 0 8px;padding:6px 10px;background:#161d26;border-left:3px solid #f59e0b'>"
             f"<b style='color:#f59e0b'>🕐 本次分析时间</b>"
@@ -1002,8 +1162,17 @@ class MainWindow(QMainWindow):
         p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>④ 订单流结构</b></p>")
         if wa.orderflow is not None:
             of = wa.orderflow
+            # 【改动点】订单流文本本地化汉化：活跃方/反转阶段英文→中文。
+            # 【涉及文件】wkf/gui/main_window.py（对应假设文件 analysis_report.py 决策文案生成）
+            # 【验证方式】执行一次行情分析，打开决策标签，订单流区域无任何英文词汇。
+            side_zh = {"buy": "买方", "sell": "卖方", "none": "无"}.get(
+                str(of.active_side).lower(), str(of.active_side))
+            stage_zh = {
+                "absorption": "吸收", "accumulation": "吸筹", "distribution": "派发",
+                "markup": "拉升", "markdown": "下跌", "active": "活跃", "none": "无",
+            }.get(str(of.reversal_stage).lower(), str(of.reversal_stage))
             p.append(
-                f"<p style='margin:2px 0;color:#e6edf3'>活跃方：{of.active_side}　|　反转阶段：{of.reversal_stage}"
+                f"<p style='margin:2px 0;color:#e6edf3'>活跃方：{side_zh}　|　反转阶段：{stage_zh}"
                 f"　|　失衡 {len(of.imbalances)} 处　|　堆叠 {len(of.stacked_imbalances)} 组</p>"
             )
         else:
@@ -1013,7 +1182,17 @@ class MainWindow(QMainWindow):
         if wa.notes:
             p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>⑤ 备注</b></p>")
             for n in wa.notes:
-                p.append(f"<p style='margin:2px 0;color:#8b949e'>· {html.escape(n)}</p>")
+                # 【改动点】备注汉化：吸收阶段固定文案 + 其余英文关键词替换为中文
+                note = html.escape(n)
+                if wa.orderflow is not None and str(wa.orderflow.reversal_stage).lower() == "absorption":
+                    note = "订单流处于反转「吸收」阶段，尚需主动行为确认"
+                else:
+                    for en, zh in (
+                        ("absorption", "吸收"), ("accumulation", "吸筹"),
+                        ("distribution", "派发"), ("buy", "买方"), ("sell", "卖方"),
+                    ):
+                        note = note.replace(en, zh)
+                p.append(f"<p style='margin:2px 0;color:#8b949e'>· {note}</p>")
 
         # ── 底部：行情概率总结（基于本页盘面结论的确定性测算，红色加粗）────
         prob = self._compute_probabilities(wa)
@@ -1189,7 +1368,7 @@ class MainWindow(QMainWindow):
         if checked:
             # 开启时记录当前 bar 作为基准，避免立即重复分析
             symbol = self._sym_combo.currentText()
-            timeframe = self._tf_combo.currentText()
+            timeframe = self._current_tf()
             ts = get_latest_bar_ts(symbol, timeframe)
             if ts > 0:
                 self._last_bar_ts = ts
@@ -1204,7 +1383,7 @@ class MainWindow(QMainWindow):
         if self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
-        timeframe = self._tf_combo.currentText()
+        timeframe = self._current_tf()
         ts = get_latest_bar_ts(symbol, timeframe)
         if ts <= 0:
             return
@@ -1240,6 +1419,15 @@ class MainWindow(QMainWindow):
             pass
         return 0
 
+    def _update_clock(self) -> None:
+        """顶部北京时钟刷新：强制 Asia/Shanghai，HH:MM:SS，每秒更新。"""
+        try:
+            from wkf.util.timefmt import beijing_now
+
+            self._clock_label.setText(f"🕐 {beijing_now().strftime('%H:%M:%S')}")
+        except Exception:
+            pass  # 时钟异常不影响主流程
+
     def _update_kline_status(self) -> None:
         """K线收盘倒计时：1 秒定时器秒级实时刷新（修复原 5 秒刷新的滞后问题）。
 
@@ -1254,7 +1442,7 @@ class MainWindow(QMainWindow):
         if self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
-        timeframe = self._tf_combo.currentText()
+        timeframe = self._current_tf()
         now_mono = time.monotonic()
 
         # 首次测量服务器时钟偏移（缓存；服务器时区固定，一次即可）

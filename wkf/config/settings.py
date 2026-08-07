@@ -28,8 +28,16 @@ class GeneralSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     analysis_bar_count: int = 48  # 图表默认时间级别 = 48小时窗口；此为根数下限
-    last_symbol: str = "NQ1!"
-    last_timeframe: str = "15m"
+    # 【改动点】默认品种 XAU/USD(GC1!)、默认周期 5 分钟（覆盖原 NQ1!/15m 默认）
+    # 【涉及文件】wkf/config/settings.py（对应 config_manager.py 默认配置）
+    # 【验证方式】首次启动品种=GC1!、周期=5分
+    last_symbol: str = "GC1!"
+    last_timeframe: str = "5m"
+    # 【改动点】「品种-周期」独立记忆键值对：切换品种恢复该品种上次周期，
+    #           切换周期立即写回；重启记忆不丢失。
+    # 【涉及文件】wkf/config/settings.py
+    # 【验证方式】GC1! 选30分→切XAU选5分→切回GC1!恢复30分；重启保留
+    per_symbol_timeframe: dict[str, str] = Field(default_factory=dict)
     # K线明细表格渲染样式: "new"=表格UI(默认) / "old"=旧版纯文本(一键回滚)
     table_style: str = "new"
     # 首次启动标志：用于启动时弹窗引导基础配置（AI Key / 飞书 Webhook）
