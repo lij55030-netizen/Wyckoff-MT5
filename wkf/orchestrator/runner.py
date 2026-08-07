@@ -139,3 +139,64 @@ def run_analysis(
 
     res.latency_ms = (time.monotonic() - t0) * 1000
     return res
+
+
+def fetch_frame_only(
+    symbol: str,
+    timeframe: str,
+    *,
+    bar_count: int = 100,
+    settings: Settings | None = None,
+) -> tuple[KlineFrame, WyckoffAnalysis | None, str]:
+    """仅获取数据+指标+订单流+威科夫分析（不调用 AI，速度快）。
+
+    Returns
+    -------
+    (frame, wyckoff, error) — error 为空串表示成功。
+    """
+    from wkf.config.settings import load_settings
+
+    settings = settings or load_settings()
+    try:
+        bars = fetch_mt5_bars(symbol, timeframe, bar_count)
+        if not bars:
+            return None, None, "MT5 返回空 K 线数据"
+
+        ind_cfg = settings.indicators
+        ind = compute_indicators(
+            bars,
+            rsi_period=ind_cfg.rsi_period,
+            bollinger_period=ind_cfg.bollinger_period,
+            bollinger_std=ind_cfg.bollinger_std,
+            ema_period=ind_cfg.ema_period,
+            atr_period=ind_cfg.atr_period,
+        )
+        frame = KlineFrame(
+            symbol=symbol, timeframe=timeframe,
+            bars=tuple(bars), indicators=ind,
+        )
+        frame = enrich_frame_with_orderflow(frame, va_pct=ind_cfg.value_area_pct)
+        wa = analyze(
+            frame,
+            va_pct=ind_cfg.value_area_pct,
+            swing_window=ind_cfg.swing_window,
+            footprint_threshold=ind_cfg.footprint_threshold,
+        )
+        return frame, wa, ""
+    except Exception as exc:
+        logger.exception("WKF 数据获取失败")
+        return None, None, str(exc)
+
+
+def get_latest_bar_ts(symbol: str, timeframe: str) -> int:
+    """获取最新已收盘 K 线的 ts_open（用于检测新 K 线收盘）。
+
+    返回 -1 表示获取失败。
+    """
+    try:
+        bars = fetch_mt5_bars(symbol, timeframe, 2)
+        if bars:
+            return bars[0].ts_open
+        return -1
+    except Exception:
+        return -1
