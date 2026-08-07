@@ -49,10 +49,10 @@ class DeepSeekClient:
             "model": self._settings.model,
             "messages": messages,
             "timeout": timeout_s,
-            # 思考(thinking)模式下 reasoning 会占用输出预算；8192 常被思考耗尽
-            # 导致正式回答被截断为空（实测 reasoning_tokens=8192 时 content 为空）。
-            # 提高到 16384，保证思考之后仍有空间输出正式诊断。
-            "max_tokens": 16384,
+            # 思考(thinking)模式下 reasoning 会占用输出预算；8192/16384 均曾被思考耗尽
+            # 导致正式回答被截断为空（实测 reasoning_tokens=16384 时 content 为空）。
+            # 提高到 32768（API 接受上限内），保证思考之后仍有空间输出正式诊断。
+            "max_tokens": 32768,
         }
         if use_thinking and "deepseek" in (self._settings.base_url or "").lower():
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}

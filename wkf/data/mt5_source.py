@@ -214,8 +214,12 @@ def enrich_frame_with_orderflow(
             try:
                 newest_ts = bars[0].ts_open
                 oldest_ts = bars[-1].ts_open
-                # 用「当前时间」作为上限，确保最新 bar 的 tick 也被拉取
-                dt_to = datetime.datetime.now()
+                # 用「最新 bar 开盘 + 周期」构造上限（服务器时钟时间戳 → datetime），
+                # 与 tick.time_msc 处于同一时钟基准。不能直接用 datetime.now()——
+                # 真实 UTC 比服务器时钟慢约 3 小时，会导致最新 bar 的 tick 拉不到
+                # （footprint[0]=None / delta[0]=0）。
+                period_ms = (bars[0].ts_open - bars[1].ts_open) if n > 1 else 900_000
+                dt_to = datetime.datetime.fromtimestamp((newest_ts + period_ms) / 1000)
                 dt_from = datetime.datetime.fromtimestamp(oldest_ts / 1000)
                 ticks = fetch_ticks_for_range(frame.symbol, dt_from, dt_to)
                 buckets = _split_ticks_by_bar(ticks or [], bars)
