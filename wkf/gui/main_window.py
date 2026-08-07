@@ -37,6 +37,8 @@ from wkf.orchestrator.runner import (
 SYMBOLS = ["NQ1!", "ES1!", "GC1!"]
 TIMEFRAMES = ["5m", "10m", "15m", "30m", "1h"]
 TF_MINUTES = {"5m": 5, "10m": 10, "15m": 15, "30m": 30, "1h": 60}
+# 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口）
+WINDOW_HOURS = 48
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +83,15 @@ class MainWindow(QMainWindow):
         self._tf_combo.addItems(TIMEFRAMES)
         self._tf_combo.setCurrentText("15m")
         ctrl.addWidget(self._tf_combo)
+
+        # 品种/周期变更 → 自动刷新图表（带 300ms 防抖，快速连续切换只发最后一次请求）
+        # 关键修复：之前下拉框未连接任何信号，切换品种后图表从不刷新
+        self._sym_combo.currentIndexChanged.connect(self._on_selector_changed)
+        self._tf_combo.currentIndexChanged.connect(self._on_selector_changed)
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(300)
+        self._debounce_timer.timeout.connect(self._on_fetch_data)
 
         self._fetch_btn = QPushButton("🔄 获取数据")
         self._fetch_btn.clicked.connect(self._on_fetch_data)
@@ -166,6 +177,9 @@ class MainWindow(QMainWindow):
         self._analysis_busy = False
         self._history_count = 0
         self._has_ai_result = False
+        # 请求令牌：记录最近一次 fetch/analyze 请求对应的品种+周期，
+        # 响应返回时若用户已切换，则丢弃过期结果，防止旧品种数据覆盖新图表
+        self._fetch_req = ("", "")
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_check_kline)
         self._status_timer = QTimer(self)
@@ -174,6 +188,23 @@ class MainWindow(QMainWindow):
 
         # 启动后立即拉一次数据 + 状态
         self._on_fetch_data()
+
+    # ── 48 小时时间级别：按周期换算需要拉取的K线根数 ─────────────────────
+    def _window_bar_count(self, timeframe: str) -> int:
+        """返回 48 小时窗口对应的K线根数（含用户自定义根数下限）。"""
+        minutes = TF_MINUTES.get(timeframe, 15)
+        base = WINDOW_HOURS * 60 // minutes  # 48h 对应根数
+        # 若用户在「其他设置」调大了K线数量则尊重用户配置（显示更多）
+        return max(base, getattr(self._settings.general, "analysis_bar_count", 48))
+
+    def _on_selector_changed(self) -> None:
+        """品种/周期变更：显示加载状态并防抖触发刷新。"""
+        sym = self._sym_combo.currentText()
+        tf = self._tf_combo.currentText()
+        self._has_ai_result = False  # 新品种数据，旧 AI 结果作废
+        self._kline_status.setText(f"⏳ 切换中，加载 {sym} {tf} ...")
+        self._tab_data.setPlainText(f"⏳ 正在加载 {sym} {tf}（48小时窗口）...")
+        self._debounce_timer.start()
 
     def _append_history(self, symbol: str, timeframe: str, bias: str, report: str) -> None:
         """把一次分析结果加入历史记录面板。"""
@@ -224,12 +255,16 @@ class MainWindow(QMainWindow):
     def _on_fetch_data(self) -> None:
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
+        self._fetch_req = (symbol, timeframe)  # 记录请求令牌
         self._fetch_btn.setEnabled(False)
-        self._tab_data.setPlainText(f"⏳ 获取 {symbol} {timeframe} 数据...")
+        bar_count = self._window_bar_count(timeframe)
+        self._tab_data.setPlainText(
+            f"⏳ 获取 {symbol} {timeframe} 数据（{WINDOW_HOURS}h 窗口，{bar_count} 根）..."
+        )
 
         def _work() -> None:
             frame, wa, err = fetch_frame_only(
-                symbol, timeframe, settings=self._settings
+                symbol, timeframe, bar_count=bar_count, settings=self._settings
             )
             self._fetch_done.emit(frame, wa, err)
 
@@ -238,8 +273,12 @@ class MainWindow(QMainWindow):
     def _on_fetch_done(self, frame, wa, err: str) -> None:
         """获取数据完成（主线程）。"""
         self._fetch_btn.setEnabled(True)
+        # 防竞态：用户已切换品种/周期则丢弃过期响应
+        if self._fetch_req != (self._sym_combo.currentText(), self._tf_combo.currentText()):
+            return
         if err:
             self._tab_data.setPlainText(f"❌ 获取失败: {err}")
+            self._kline_status.setText(f"❌ 获取失败: {err[:60]}")
             return
         if frame is not None:
             self._chart.set_frame(frame)
@@ -247,18 +286,28 @@ class MainWindow(QMainWindow):
         # 仅当尚无 AI 分析结果时才填充各页，避免覆盖已完成的 AI 诊断
         if frame is not None and not getattr(self, "_has_ai_result", False):
             self._populate_tabs(frame, wa, None)
+            hours = WINDOW_HOURS
             self._tab_data.setPlainText(
-                f"✅ 数据已更新（未跑 AI，可点「📝 提交分析」）\n\n" + self._render_data_tab(frame)
+                f"✅ {frame.symbol} {frame.timeframe} 已更新（{hours}h 窗口，{len(frame.bars)} 根）\n\n"
+                + self._render_data_tab(frame)
             )
+        if frame is not None:
+            latest_ts = datetime.datetime.fromtimestamp(frame.bars[0].ts_open / 1000).strftime("%H:%M")
+            self._kline_status.setText(f"K线: {latest_ts} 收盘 · {WINDOW_HOURS}h 窗口 · {len(frame.bars)} 根")
 
     def _on_analyze(self) -> None:
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
+        self._fetch_req = (symbol, timeframe)  # 分析同样更新令牌
         self._analyze_btn.setEnabled(False)
-        self._tab_data.setPlainText(f"⏳ 正在分析 {symbol} {timeframe} ...")
+        bar_count = self._window_bar_count(timeframe)
+        self._tab_data.setPlainText(f"⏳ 正在分析 {symbol} {timeframe}（{WINDOW_HOURS}h 窗口）...")
 
         def _work() -> None:
-            res = run_analysis(symbol, timeframe, settings=self._settings, with_ai=True)
+            res = run_analysis(
+                symbol, timeframe, bar_count=bar_count,
+                settings=self._settings, with_ai=True,
+            )
             self._analysis_done.emit(res)
 
         self._analysis_busy = True
@@ -268,6 +317,9 @@ class MainWindow(QMainWindow):
         """分析完成（主线程）。"""
         self._analyze_btn.setEnabled(True)
         self._analysis_busy = False
+        # 防竞态：分析期间用户切了品种/周期 → 丢弃过期结果
+        if self._fetch_req != (self._sym_combo.currentText(), self._tf_combo.currentText()):
+            return
         self._has_ai_result = True
         if res.error:
             self._tab_data.setPlainText(f"❌ 分析失败: {res.error}")

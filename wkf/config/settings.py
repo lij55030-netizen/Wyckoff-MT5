@@ -27,7 +27,7 @@ class ProviderSettings(BaseModel):
 class GeneralSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    analysis_bar_count: int = 100
+    analysis_bar_count: int = 48  # 图表默认时间级别 = 48小时窗口；此为根数下限
     last_symbol: str = "NQ1!"
     last_timeframe: str = "15m"
 
