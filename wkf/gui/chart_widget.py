@@ -65,15 +65,29 @@ class WkfChart(QWidget):
         self._plot = pg.PlotWidget()
         self._plot.showGrid(x=True, y=True, alpha=0.15)
         self._plot.setBackground("#0d1117")
+        # 【改动点】需求3：显式开启鼠标交互——左键拖拽平移 + 滚轮放大缩小，
+        # 解除坐标轴锁定限制（pyqtgraph 默认开启，此处显式声明以防配置覆盖）。
+        # 【涉及文件】wkf/gui/chart_widget.py（对应假设文件 kline_chart.py）
+        # 【验证方式】滚轮上下滚动实现 K 线放大/缩小；左键按住横向拖动平移图表
+        self._plot.setMouseEnabled(x=True, y=True)
         layout.addWidget(self._plot)
 
-        # RSI 子图
+        # RSI 子图（同样开启交互）
         self._rsi_plot = pg.PlotWidget()
         self._rsi_plot.setBackground("#0d1117")
         self._rsi_plot.setFixedHeight(90)
         self._rsi_plot.showGrid(x=True, y=True, alpha=0.15)
         self._rsi_plot.setYRange(0, 100)
+        self._rsi_plot.setMouseEnabled(x=True, y=True)
         layout.addWidget(self._rsi_plot)
+
+        # 【改动点】需求3：用户手动缩放/平移标记——sigRangeChangedManually 仅由用户操作触发；
+        # set_frame 刷新时若用户已手动调整视图，则不再强制 autoRange 重置，保留视图位置。
+        self._user_viewed = False
+        self._last_symbol: str | None = None
+        self._plot.getPlotItem().vb.sigRangeChangedManually.connect(
+            lambda *_: setattr(self, "_user_viewed", True)
+        )
 
         self._items: list = []
 
@@ -277,19 +291,28 @@ class WkfChart(QWidget):
         n = len(frame.bars)
         if n == 0:
             return
+        # 【改动点】需求3：切换品种时重置用户视图标记（新数据需重新自动适配）；
+        # 同品种刷新/用户已手动缩放平移时保持视图，不强制重置坐标轴。
+        # 【涉及文件】wkf/gui/chart_widget.py（对应假设文件 kline_chart.py）
+        # 【验证方式】手动缩放视图后刷新 K 线，视图不自动复位；切换品种后重新适配
+        if frame.symbol != self._last_symbol:
+            self._last_symbol = frame.symbol
+            self._user_viewed = False
+        do_autorange = not self._user_viewed
+
         # bars 为 新->旧（seq=1 最新在 index 0）；x 数组递减生成，
         # 让最新一根 K 线显示在图表最右侧（时间从左往右）
         x = np.arange(n, dtype=float)[::-1]  # n-1(最新) ... 0(最旧)
         self._render_candles(frame, x)
         self._render_indicator_lines(frame, x)
-        # 先 autoRange 确定真实视图范围，再画 Delta 条
-        # （Delta 条依赖 viewRange 取底部基准，若在 autoRange 前调用会拿到
-        #   默认范围 [-0.5,0.5]，导致 Delta 画到错误位置并二次污染范围）
-        self._plot.autoRange()
+        # 仅在首次加载/切换品种时 autoRange 确定视图；用户手动缩放后保留视图。
+        # （Delta 条依赖 viewRange 取底部基准，须在 autoRange 后调用）
+        if do_autorange:
+            self._plot.autoRange()
         self._render_delta_bars(frame, x)
-        self._plot.autoRange()
         self._render_rsi(frame, x)
-        self._rsi_plot.autoRange()
+        if do_autorange:
+            self._rsi_plot.autoRange()
 
         # 保存当前数据帧（供十字线吸附读取 OHLC/时间戳）
         self._frame = frame

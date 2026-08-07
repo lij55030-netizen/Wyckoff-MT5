@@ -141,6 +141,44 @@ def run_analysis(
     return res
 
 
+def _build_frame(
+    symbol: str,
+    timeframe: str,
+    bars: list,
+    settings: Settings,
+    *,
+    fetch_ticks: bool = True,
+) -> tuple[KlineFrame, WyckoffAnalysis | None]:
+    """由 K线 bars 构建 frame（指标 + 订单流 + 威科夫）。
+
+    【改动点】从 fetch_frame_only 抽出公共构建逻辑，供磁盘缓存命中路径复用
+    （fetch_ticks=False 时跳过 tick 拉取，秒级出图；首次完整拉取时 fetch_ticks=True）。
+    """
+    ind_cfg = settings.indicators
+    ind = compute_indicators(
+        bars,
+        rsi_period=ind_cfg.rsi_period,
+        bollinger_period=ind_cfg.bollinger_period,
+        bollinger_std=ind_cfg.bollinger_std,
+        ema_period=ind_cfg.ema_period,
+        atr_period=ind_cfg.atr_period,
+    )
+    frame = KlineFrame(
+        symbol=symbol, timeframe=timeframe,
+        bars=tuple(bars), indicators=ind,
+    )
+    frame = enrich_frame_with_orderflow(
+        frame, va_pct=ind_cfg.value_area_pct, fetch_ticks=fetch_ticks,
+    )
+    wa = analyze(
+        frame,
+        va_pct=ind_cfg.value_area_pct,
+        swing_window=ind_cfg.swing_window,
+        footprint_threshold=ind_cfg.footprint_threshold,
+    )
+    return frame, wa
+
+
 def fetch_frame_only(
     symbol: str,
     timeframe: str,
@@ -161,31 +199,54 @@ def fetch_frame_only(
         bars = fetch_mt5_bars(symbol, timeframe, bar_count)
         if not bars:
             return None, None, "MT5 返回空 K 线数据"
-
-        ind_cfg = settings.indicators
-        ind = compute_indicators(
-            bars,
-            rsi_period=ind_cfg.rsi_period,
-            bollinger_period=ind_cfg.bollinger_period,
-            bollinger_std=ind_cfg.bollinger_std,
-            ema_period=ind_cfg.ema_period,
-            atr_period=ind_cfg.atr_period,
-        )
-        frame = KlineFrame(
-            symbol=symbol, timeframe=timeframe,
-            bars=tuple(bars), indicators=ind,
-        )
-        frame = enrich_frame_with_orderflow(frame, va_pct=ind_cfg.value_area_pct)
-        wa = analyze(
-            frame,
-            va_pct=ind_cfg.value_area_pct,
-            swing_window=ind_cfg.swing_window,
-            footprint_threshold=ind_cfg.footprint_threshold,
-        )
+        frame, wa = _build_frame(symbol, timeframe, bars, settings)
         return frame, wa, ""
     except Exception as exc:
         logger.exception("WKF 数据获取失败")
         return None, None, str(exc)
+
+
+def fetch_frame_cached(
+    symbol: str,
+    timeframe: str,
+    *,
+    bar_count: int = 100,
+    settings: Settings | None = None,
+    use_disk_cache: bool = True,
+) -> tuple[KlineFrame, WyckoffAnalysis | None, str, bool]:
+    """三级取数（内存缓存由 GUI 层负责）：磁盘缓存 → MT5 网络拉取。
+
+    【改动点】需求2-3：K线磁盘缓存，重复访问同一品种周期直接读缓存跳过接口请求。
+    【涉及文件】wkf/orchestrator/runner.py + wkf/data/cache_manager.py
+    【验证方式】首次拉取后再次访问同品种周期：磁盘命中（返回 from_cache=True），
+               秒级出图；cache/kline_*.json 文件生成。
+    Returns
+    -------
+    (frame, wyckoff, error, from_cache)
+    """
+    from wkf.config.settings import load_settings
+    from wkf.data.cache_manager import disk_cache_get, disk_cache_put
+
+    settings = settings or load_settings()
+    try:
+        if use_disk_cache:
+            bars = disk_cache_get(symbol, timeframe)
+            if bars:
+                # 磁盘命中：跳过 MT5 与 tick 拉取，秒级出图
+                frame, wa = _build_frame(
+                    symbol, timeframe, bars, settings, fetch_ticks=False
+                )
+                return frame, wa, "", True
+        bars = fetch_mt5_bars(symbol, timeframe, bar_count)
+        if not bars:
+            return None, None, "MT5 返回空 K 线数据", False
+        frame, wa = _build_frame(symbol, timeframe, bars, settings)
+        if use_disk_cache:
+            disk_cache_put(symbol, timeframe, bars)
+        return frame, wa, "", False
+    except Exception as exc:
+        logger.exception("WKF 数据获取失败")
+        return None, None, str(exc), False
 
 
 def get_latest_bar_ts(symbol: str, timeframe: str) -> int:

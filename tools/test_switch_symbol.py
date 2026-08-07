@@ -106,13 +106,13 @@ print("=" * 60)
 print("测试4: 异常处理（直接调用 fetch 传无效周期）")
 print("=" * 60)
 win._tf_combo.setCurrentIndex(win._tf_combo.findData("1h"))  # 正常
-# 用 monkeypatch 模拟失败
-from wkf.gui import main_window as mw  # noqa: E402
-orig_fetch = mw.fetch_frame_only
-mw.fetch_frame_only = lambda *a, **k: (None, None, "模拟获取失败: MT5 无数据")
+# 用 monkeypatch 模拟失败（V1.3.1 起取数走 fetch_frame_cached 三级缓存）
+from wkf.orchestrator import runner as _runner  # noqa: E402
+orig_cached = _runner.fetch_frame_cached
+_runner.fetch_frame_cached = lambda *a, **k: (None, None, "模拟获取失败: MT5 无数据", False)
 win._on_fetch_data()
 wait_fetch(win)
-mw.fetch_frame_only = orig_fetch
+_runner.fetch_frame_cached = orig_cached
 err_txt = win._tab_data.toPlainText()
 check("失败时显示错误提示", "❌" in err_txt and "失败" in err_txt,
       f"错误提示: {err_txt[:60]!r}")

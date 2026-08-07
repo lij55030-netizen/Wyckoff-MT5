@@ -379,9 +379,28 @@ class MainWindow(QMainWindow):
         self._data_table = self._tab_data.table
         tabs.addTab(self._tab_data, "📊 数据")
 
-        self._tab_snapshot = QPlainTextEdit()
-        self._tab_snapshot.setReadOnly(True)
-        self._tab_snapshot.setMaximumBlockCount(2000)
+        # 【改动点】快照标签页：容器化（保存按钮 + 正文 + 底部生成时间）。
+        # 行情快照保存文件名嵌入北京时间戳；预览面板底部常驻展示快照生成时间。
+        # 【涉及文件】wkf/gui/main_window.py（对应假设文件 snapshot_widget.py / snapshot_manager.py）
+        # 【验证方式】点「保存快照」→ output/snapshot_YYYYMMDD_HHMMSS.txt；预览底部显示北京时间
+        self._tab_snapshot = QWidget()
+        snap_layout = QVBoxLayout(self._tab_snapshot)
+        snap_layout.setContentsMargins(4, 4, 4, 4)
+        snap_layout.setSpacing(4)
+        snap_bar = QHBoxLayout()
+        self._snapshot_save_btn = QPushButton("💾 保存快照")
+        self._snapshot_save_btn.setToolTip("将当前行情快照保存为文件（文件名含北京时间戳）")
+        self._snapshot_save_btn.clicked.connect(self._save_snapshot)
+        snap_bar.addWidget(self._snapshot_save_btn)
+        snap_bar.addStretch(1)
+        snap_layout.addLayout(snap_bar)
+        self._tab_snapshot_text = QPlainTextEdit()
+        self._tab_snapshot_text.setReadOnly(True)
+        self._tab_snapshot_text.setMaximumBlockCount(2000)
+        snap_layout.addWidget(self._tab_snapshot_text)
+        self._snapshot_time_label = QLabel("快照生成时间：--")
+        self._snapshot_time_label.setStyleSheet("color:#8b949e;font-size:12px;")
+        snap_layout.addWidget(self._snapshot_time_label)
         tabs.addTab(self._tab_snapshot, "📸 快照")
 
         self._tab_diagnosis = QPlainTextEdit()
@@ -731,8 +750,16 @@ class MainWindow(QMainWindow):
             return
 
         def _work() -> None:
-            frame, wa, err = fetch_frame_only(
-                symbol, timeframe, bar_count=bar_count, settings=self._settings
+            # 【改动点】需求2：三级取数——内存缓存(外层已查) → 磁盘缓存 → MT5 网络。
+            # 磁盘命中跳过 MT5 与 tick 拉取（fetch_ticks=False），秒级出图；
+            # 首次拉取后写磁盘缓存，重复访问同一品种周期直接读取。
+            # 【涉及文件】wkf/gui/main_window.py + wkf/orchestrator/runner.py + wkf/data/cache_manager.py
+            # 【验证方式】同品种二次切换加载耗时显著下降（磁盘命中），cache/ 目录生成缓存文件
+            from wkf.orchestrator.runner import fetch_frame_cached
+
+            frame, wa, err, _from_cache = fetch_frame_cached(
+                symbol, timeframe, bar_count=bar_count, settings=self._settings,
+                use_disk_cache=True,
             )
             if frame is not None and not err:
                 self._frame_cache[key] = (time.monotonic(), frame, wa)
@@ -981,7 +1008,12 @@ class MainWindow(QMainWindow):
         else:
             self._tab_data.set_plain_mode(False)
             self._populate_data_table(frame)
-        self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
+        self._tab_snapshot_text.setPlainText(self._render_snapshot_tab(frame, wa))
+        # 【改动点】快照预览底部展示生成时间（北京时间，与决策/诊断同源）
+        self._snapshot_time_label.setText(
+            f"快照生成时间：{beijing_now_str()}"
+        )
+        # 【改动点】诊断面板顶部新增诊断生成时间（北京时间，与决策面板同源）
         self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
         self._tab_decision.setHtml(self._render_decision_tab(wa))  # 富文本（红色粗体结论）
         # 提交分析联动：在问AI面板自动追加一条完整分析日志（推理步骤 + Token 消耗）
@@ -1051,11 +1083,46 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _render_diagnosis_tab(self, frame, wa) -> str:
-        """诊断标签页：为什么这么分析（威科夫三层推理）。"""
+        """诊断标签页：为什么这么分析（威科夫三层推理）。
+
+        【改动点】顶部新增诊断生成时间（北京时间，与决策面板分析时间同源）。
+        【涉及文件】wkf/gui/main_window.py（对应假设文件 diagnosis_widget.py）
+        【验证方式】打开诊断标签可见顶部生成时间，且与决策面板时间一致
+        """
         if wa is None:
             return "未分析"
-        lines = [wa.render_text()]
+        lines = [f"🔍 诊断生成时间：{beijing_now_str()}", ""]
+        lines.append(wa.render_text())
         return "\n".join(lines)
+
+    def _save_snapshot(self) -> None:
+        """保存当前行情快照为文件（文件名嵌入北京时间戳）。
+
+        【改动点】快照保存：output/snapshot_YYYYMMDD_HHMMSS.txt，文件名含时间戳。
+        【涉及文件】wkf/gui/main_window.py（对应假设文件 snapshot_manager.py）
+        【验证方式】点击「保存快照」生成 output/snapshot_*.txt，文件名含北京时间
+        """
+        try:
+            from wkf.config.settings import SETTINGS_JSON_PATH
+
+            out_dir = SETTINGS_JSON_PATH.parent.parent / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = beijing_now_str().replace("-", "").replace(":", "").replace(" ", "_")
+            path = out_dir / f"snapshot_{ts}.txt"
+            content = self._tab_snapshot_text.toPlainText()
+            if not content.strip():
+                content = self._snapshot_time_label.text()
+            path.write_text(
+                f"WKF 行情快照\n生成时间：{beijing_now_str()}\n{'=' * 40}\n{content}",
+                encoding="utf-8",
+            )
+            from PyQt6.QtWidgets import QMessageBox
+
+            QMessageBox.information(self, "快照已保存", f"已保存至：\n{path}")
+        except Exception as exc:
+            from PyQt6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "保存失败", f"快照保存失败：{exc}")
 
     def _compute_probabilities(self, wa) -> dict:
         """行情概率测算（确定性规则，完全基于 wa 现有盘面字段，可复现、不虚构）。

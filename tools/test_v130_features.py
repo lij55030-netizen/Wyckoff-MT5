@@ -19,9 +19,11 @@ def chk(name, cond):
     if not cond:
         ok = False
 
-# 0. 配置准备：避免首次启动弹窗 + 记录原值
+# 0. 配置准备：避免首次启动弹窗 + 恢复默认基线（防测试间顺序耦合）
 s0 = load_settings()
 s0.general.first_run = False
+s0.general.last_symbol = "GC1!"
+s0.general.last_timeframe = "5m"
 save_settings(s0, r"E:\workbuddy\MT50802\wkf\config\settings.json")
 
 # ── 模块一：周期枚举与排序 ──────────────────────────────────────────────
