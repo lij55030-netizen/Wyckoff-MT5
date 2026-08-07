@@ -673,6 +673,62 @@ class MainWindow(QMainWindow):
         lines = [wa.render_text()]
         return "\n".join(lines)
 
+    def _compute_probabilities(self, wa) -> dict:
+        """行情概率测算（确定性规则，完全基于 wa 现有盘面字段，可复现、不虚构）。
+
+        依据：
+          ① 趋势结构：regime + HH+HL / LH+LL 摆动计数
+          ② 订单流状态：active_side（买/卖方主导）+ reversal_stage
+          ③ VWAP 位置：现价高于/低于 VWAP（决定多空承压方向）
+        输出：空头/多头/震荡观望 三个概率（和为 100%）。
+        """
+        long_p, short_p, neutral_p = 33.0, 33.0, 34.0  # 中性基线
+
+        bg = wa.background
+        # ① 趋势结构
+        if bg.regime == "trend_up":
+            long_p += 15 + min(bg.hh_hl_count, 5) * 3
+            short_p -= 8
+        elif bg.regime == "trend_down":
+            short_p += 15 + min(bg.lh_ll_count, 5) * 3
+            long_p -= 8
+        elif bg.regime == "range":
+            neutral_p += 20
+            long_p -= 8
+            short_p -= 8
+
+        # ② 订单流状态
+        if wa.orderflow is not None:
+            of = wa.orderflow
+            if of.active_side == "buy":
+                long_p += 8
+            elif of.active_side == "sell":
+                short_p += 8
+            if of.reversal_stage == "absorption":
+                # 吸收阶段：多空趋于平衡，增加震荡权重
+                neutral_p += 5
+                long_p -= 2
+                short_p -= 3
+
+        # ③ VWAP 位置（价格承压/支撑方向）
+        if wa.value_area is not None and wa.value_area.vwap is not None and wa.price is not None:
+            if wa.price > wa.value_area.vwap:
+                long_p += 6
+            elif wa.price < wa.value_area.vwap:
+                short_p += 6
+
+        # 归一化到 100%（截断负值后按比例缩放）
+        long_p = max(0.0, long_p)
+        short_p = max(0.0, short_p)
+        neutral_p = max(0.0, neutral_p)
+        total = long_p + short_p + neutral_p
+        if total <= 0:
+            return {"short": 33, "long": 33, "neutral": 34}
+        long_pct = round(long_p / total * 100)
+        short_pct = round(short_p / total * 100)
+        neutral_pct = 100 - long_pct - short_pct  # 保证三项合计恒为 100
+        return {"short": short_pct, "long": long_pct, "neutral": neutral_pct}
+
     def _render_decision_tab(self, wa) -> str:
         """决策标签页（文案规范化重写）：行情倾向/入场触发/失效阈值/订单流结构/备注。
 
@@ -723,6 +779,15 @@ class MainWindow(QMainWindow):
             p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>⑤ 备注</b></p>")
             for n in wa.notes:
                 p.append(f"<p style='margin:2px 0;color:#8b949e'>· {html.escape(n)}</p>")
+
+        # ── 底部：行情概率总结（基于本页盘面结论的确定性测算，红色加粗）────
+        prob = self._compute_probabilities(wa)
+        p.append(
+            "<p style='margin:10px 0 2px;border-top:1px solid #2a3442;padding-top:8px'>"
+            "<b style='color:#ef4444;font-size:14px'>"
+            f"当前盘面综合研判：空头行情概率 {prob['short']}%，多头行情概率 {prob['long']}%，震荡观望概率 {prob['neutral']}%"
+            "</b></p>"
+        )
 
         p.append("</div>")
         return "".join(p)
