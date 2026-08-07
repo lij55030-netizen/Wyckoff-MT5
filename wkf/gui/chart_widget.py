@@ -1,6 +1,7 @@
 """K线图控件：K线 + EMA20 + 布林带 + VWAP + POC/VA 阴影 + Delta 底部条。"""
 from __future__ import annotations
 
+import datetime
 import math
 
 import numpy as np
@@ -8,6 +9,49 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from wkf.data.base import KlineFrame
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 可配置项（颜色 / 线宽 / 标签显隐等，便于后续维护与扩展）
+# ────────────────────────────────────────────────────────────────────────────
+CROSSHAIR_CFG = {
+    "line_color": (148, 163, 184),   # 十字线颜色（灰蓝）
+    "line_width": 1,                 # 十字线线宽
+    "line_style": "dash",            # 线型: solid / dash / dot
+    "label_visible": True,           # 光标数值标签显隐
+    "label_bg": (13, 17, 23, 210),   # 标签背景（半透明深色）
+    "label_fg": "#e6edf3",           # 标签前景文字色
+    "label_border": "#3b82f6",       # 标签描边色
+    "rsi_sync": True,                # RSI 副图是否同步垂直光标线
+}
+
+LAST_PRICE_CFG = {
+    "color": "#ef4444",              # 实时价格线颜色（醒目红）
+    "width": 1.5,                    # 价格线宽
+    "style": "solid",                # 线型
+    "label_visible": True,           # 价格标签显隐
+    "label_bg": (239, 68, 68, 220),  # 价格标签背景（红色半透明）
+    "label_fg": "#ffffff",           # 价格标签文字色
+    "label_border": "#ef4444",       # 标签描边
+    "currency": "USD",               # 价格货币单位（显示于标签右侧）
+    "decimals": 2,                   # 价格小数位数
+}
+
+# 绘制层级：K线 < VA/POC < 实时价格线 < 十字线（光标最上层）
+_Z_LAST_PRICE_LINE = 20
+_Z_LAST_PRICE_LABEL = 21
+_Z_CROSS_LINE = 30
+_Z_CROSS_LABEL = 31
+
+
+def _pen_from(color, width, style="dash"):
+    """按配置生成 pyqtgraph 画笔（style: solid/dash/dot）。"""
+    styles = {
+        "solid": pg.QtCore.Qt.PenStyle.SolidLine,
+        "dash": pg.QtCore.Qt.PenStyle.DashLine,
+        "dot": pg.QtCore.Qt.PenStyle.DotLine,
+    }
+    return pg.mkPen(color=color, width=width, style=styles.get(style, styles["dash"]))
 
 
 class WkfChart(QWidget):
@@ -32,6 +76,68 @@ class WkfChart(QWidget):
         layout.addWidget(self._rsi_plot)
 
         self._items: list = []
+
+        # ── 覆盖层（十字线 + 实时价格线）：与 _items 独立管理，set_frame 不清除 ──
+        self._overlay_items: list = []
+        self._frame: KlineFrame | None = None  # 当前数据帧（十字线吸附用）
+        self._crosshair_enabled = False        # 十字线开关状态
+        self._in_chart_area = False            # 鼠标是否位于图表区域内
+        self._cross_idx = -1                   # 当前吸附的K线索引
+        self._mouse_scene_pos = None           # 最近一次鼠标场景坐标
+
+        # 十字线：垂直 + 水平两条线 + 数值标签 + RSI 副图垂直同步线
+        self._ch_vline = pg.InfiniteLine(
+            angle=90, movable=False, pen=_pen_from(
+                CROSSHAIR_CFG["line_color"], CROSSHAIR_CFG["line_width"],
+                CROSSHAIR_CFG["line_style"]),
+        )
+        self._ch_hline = pg.InfiniteLine(
+            angle=0, movable=False, pen=_pen_from(
+                CROSSHAIR_CFG["line_color"], CROSSHAIR_CFG["line_width"],
+                CROSSHAIR_CFG["line_style"]),
+        )
+        self._ch_label = pg.TextItem(
+            color=CROSSHAIR_CFG["label_fg"], fill=pg.mkBrush(*CROSSHAIR_CFG["label_bg"]),
+            border=CROSSHAIR_CFG["label_border"], anchor=(0, 1),
+        )
+        self._ch_rsi_vline = pg.InfiniteLine(
+            angle=90, movable=False, pen=_pen_from(
+                CROSSHAIR_CFG["line_color"], 1, CROSSHAIR_CFG["line_style"]),
+        )
+        for it in (self._ch_vline, self._ch_hline, self._ch_label):
+            it.setZValue(_Z_CROSS_LINE)
+            it.setVisible(False)
+            self._plot.addItem(it)
+            self._overlay_items.append(it)
+        self._ch_label.setZValue(_Z_CROSS_LABEL)
+        if CROSSHAIR_CFG["rsi_sync"]:
+            self._ch_rsi_vline.setVisible(False)
+            self._rsi_plot.addItem(self._ch_rsi_vline)
+            self._overlay_items.append(self._ch_rsi_vline)
+
+        # 实时价格线：红色水平线 + 右上角价格标签（含货币单位）
+        self._last_price_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=_pen_from(LAST_PRICE_CFG["color"], LAST_PRICE_CFG["width"],
+                          LAST_PRICE_CFG["style"]),
+        )
+        self._last_price_label = pg.TextItem(
+            color=LAST_PRICE_CFG["label_fg"],
+            fill=pg.mkBrush(*LAST_PRICE_CFG["label_bg"]),
+            border=LAST_PRICE_CFG["label_border"], anchor=(1, 0),
+        )
+        self._last_price_line.setZValue(_Z_LAST_PRICE_LINE)
+        self._last_price_label.setZValue(_Z_LAST_PRICE_LABEL)
+        self._last_price_line.setVisible(False)
+        self._last_price_label.setVisible(False)
+        self._plot.addItem(self._last_price_line)
+        self._plot.addItem(self._last_price_label)
+        self._overlay_items += [self._last_price_line, self._last_price_label]
+
+        # 鼠标跟踪：启用后 sigSceneMouseMoved 才能收到移动事件
+        self.setMouseTracking(True)
+        self._plot.setMouseTracking(True)
+        self._plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
 
     def clear_items(self) -> None:
         for it in self._items:
@@ -184,3 +290,131 @@ class WkfChart(QWidget):
         self._plot.autoRange()
         self._render_rsi(frame, x)
         self._rsi_plot.autoRange()
+
+        # 保存当前数据帧（供十字线吸附读取 OHLC/时间戳）
+        self._frame = frame
+        # 切换品种/刷新后旧价格线数值已过时 → 隐藏，等待新一轮 tick 到达再显示
+        self._last_price_line.setVisible(False)
+        self._last_price_label.setVisible(False)
+        # 十字线若已激活且鼠标仍在图表区域内 → 用新数据立即重画
+        if self._crosshair_enabled and self._in_chart_area and self._mouse_scene_pos is not None:
+            self._update_crosshair(self._mouse_scene_pos)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 十字线光标工具（可点击开关，独立于 K 线渲染，关闭后不留任何残留状态）
+    # ────────────────────────────────────────────────────────────────────────
+    def set_crosshair_enabled(self, enabled: bool) -> None:
+        """开关十字线：enabled=True 激活（跟随鼠标吸附K线），False 关闭并清场。"""
+        self._crosshair_enabled = enabled
+        if not enabled:
+            # 关闭：隐藏所有光标元素，清空吸附状态，恢复默认交互（拖拽/缩放不受影响）
+            self._ch_vline.setVisible(False)
+            self._ch_hline.setVisible(False)
+            self._ch_label.setVisible(False)
+            self._ch_rsi_vline.setVisible(False)
+            self._cross_idx = -1
+            self._in_chart_area = False
+        elif self._frame is not None and self._mouse_scene_pos is not None:
+            # 激活：若鼠标已在图表区域，立即用当前位置显示
+            self._update_crosshair(self._mouse_scene_pos)
+
+    def is_crosshair_enabled(self) -> bool:
+        return self._crosshair_enabled
+
+    def _on_scene_mouse_moved(self, scene_pos) -> None:
+        """场景鼠标移动（每帧触发）：记录位置，判断是否在图表区域并刷新十字线。"""
+        self._mouse_scene_pos = scene_pos
+        if not self._crosshair_enabled:
+            return
+        # 判断鼠标是否位于主图绘制区域（ViewBox 场景矩形内）
+        vb = self._plot.getPlotItem().vb
+        inside = vb.sceneBoundingRect().contains(scene_pos)
+        if inside:
+            if not self._in_chart_area:
+                self._in_chart_area = True  # 重新进入 → 恢复显示
+            self._update_crosshair(scene_pos)
+        else:
+            # 离开图表区域 → 自动隐藏十字线
+            if self._in_chart_area:
+                self._in_chart_area = False
+                self._ch_vline.setVisible(False)
+                self._ch_hline.setVisible(False)
+                self._ch_label.setVisible(False)
+                self._ch_rsi_vline.setVisible(False)
+
+    def _bar_index_at(self, vx: float) -> int:
+        """视图 x 坐标 → 最近K线索引。
+
+        坐标系说明：set_frame 里 x = arange(n)[::-1]，即最新K线(index 0)在最右
+        (x = n-1)，最旧K线(index n-1)在最左 (x = 0)。因此：
+        idx = n-1 - round(vx)，并 clamp 到 [0, n-1]。
+        """
+        n = len(self._frame.bars) if self._frame else 0
+        if n == 0:
+            return -1
+        return max(0, min(n - 1, n - 1 - int(round(vx))))
+
+    def _update_crosshair(self, scene_pos) -> None:
+        """吸附最近K线并更新十字线位置与数值标签。"""
+        if self._frame is None or not self._frame.bars:
+            return
+        vb = self._plot.getPlotItem().vb
+        vp = vb.mapSceneToView(scene_pos)
+        idx = self._bar_index_at(vp.x())
+        if idx < 0:
+            return
+        bar = self._frame.bars[idx]
+        self._cross_idx = idx
+
+        # 十字线定位：x 吸附到该K线中心，y 吸附到该K线收盘价
+        x_center = len(self._frame.bars) - 1 - idx
+        self._ch_vline.setPos(x_center)
+        self._ch_hline.setPos(bar.close)
+        self._ch_vline.setVisible(True)
+        self._ch_hline.setVisible(True)
+        if CROSSHAIR_CFG["rsi_sync"]:
+            self._ch_rsi_vline.setPos(x_center)
+            self._ch_rsi_vline.setVisible(True)
+
+        # 数值标签：默认放在十字线右上方；靠近右边界时翻转到左侧避免出界
+        if CROSSHAIR_CFG["label_visible"]:
+            xr = vb.viewRange()[0]
+            flip = x_center > (xr[0] + xr[1]) / 2
+            self._ch_label.setPos(x_center, bar.close)
+            self._ch_label.setAnchor((1, 0) if flip else (0, 1))
+            self._ch_label.setText(self._format_crosshair_label(bar))
+            self._ch_label.setVisible(True)
+
+    def _format_crosshair_label(self, bar) -> str:
+        """十字线标签文本：时间戳 + 开/高/低/收。"""
+        ts = datetime.datetime.fromtimestamp(bar.ts_open / 1000).strftime("%m-%d %H:%M")
+        return (f"{ts}\n"
+                f"开 {bar.open:.2f}  高 {bar.high:.2f}\n"
+                f"低 {bar.low:.2f}  收 {bar.close:.2f}")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 实时价格标注（红色水平线 + 价格标签，随行情平滑更新）
+    # ────────────────────────────────────────────────────────────────────────
+    def set_last_price(self, price: float) -> None:
+        """更新最新成交价红线与标签。
+
+        仅 setPos/setText（不重建 item），天然平滑无闪烁；
+        标签锚点根据价格在视图中的上下位置自动翻转，避免超出可视边界。
+        """
+        if price is None or math.isnan(price):
+            return
+        self._last_price_line.setPos(price)
+        self._last_price_line.setVisible(True)
+
+        if LAST_PRICE_CFG["label_visible"]:
+            decimals = LAST_PRICE_CFG["decimals"]
+            cur = LAST_PRICE_CFG["currency"]
+            self._last_price_label.setText(f"{price:,.{decimals}f} {cur}")
+            # 标签固定贴右边缘（x = 视图右边界），垂直跟随价格
+            vb = self._plot.getPlotItem().vb
+            xr, yr = vb.viewRange()
+            x_right = xr[1]
+            flip_up = (price - yr[0]) < (yr[1] - yr[0]) * 0.15  # 价格接近顶部 → 标签放线上方
+            self._last_price_label.setPos(x_right, price)
+            self._last_price_label.setAnchor((1, 1) if flip_up else (1, 0))
+            self._last_price_label.setVisible(True)

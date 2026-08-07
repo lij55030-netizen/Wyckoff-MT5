@@ -36,6 +36,7 @@ from wkf.config.settings import load_settings
 from wkf.data.base import KlineFrame
 from wkf.gui.chart_widget import WkfChart
 from wkf.gui.settings_dialogs import AIModelDialog, FeishuDialog, IndicatorDialog
+from wkf.data.mt5_source import resolve_mt5_symbol
 from wkf.orchestrator.runner import (
     AnalysisResult,
     fetch_frame_only,
@@ -200,6 +201,7 @@ class MainWindow(QMainWindow):
     _fetch_done = pyqtSignal(object, object, str)  # frame, wyckoff, err
     _analysis_done = pyqtSignal(object)  # AnalysisResult
     _ai_reply = pyqtSignal(str)  # 问AI对话回复（工作线程 → UI 线程）
+    _tick_updated = pyqtSignal(float)  # 最新成交价 tick 到达（工作线程 → UI 线程）
 
     def __init__(self) -> None:
         super().__init__()
@@ -263,6 +265,16 @@ class MainWindow(QMainWindow):
         )
         self._auto_check.toggled.connect(self._on_auto_toggle)
         ctrl.addWidget(self._auto_check)
+
+        # 十字光标工具：可点击开关，激活后十字线跟随鼠标吸附最近K线显示 OHLC+时间戳
+        self._crosshair_btn = QPushButton("➕ 十字光标")
+        self._crosshair_btn.setCheckable(True)  # 可点击开关：点击激活/再点关闭
+        self._crosshair_btn.setToolTip(
+            "开启/关闭十字线光标：激活后鼠标在图表区移动自动吸附最近K线，"
+            "显示该K线的开/高/低/收与时间戳；离开图表区域自动隐藏"
+        )
+        self._crosshair_btn.toggled.connect(self._on_crosshair_toggle)
+        ctrl.addWidget(self._crosshair_btn)
 
         self._kline_status = QLabel("K线: --")
         self._kline_status.setStyleSheet("color:#8b949e;font-size:12px")
@@ -358,8 +370,21 @@ class MainWindow(QMainWindow):
         self._status_timer.timeout.connect(self._update_kline_status)
         self._status_timer.start(1000)  # 1 秒定时器：秒级实时倒计时
 
+        # ── 实时价格标注：每 2 秒后台轮询 MT5 最新 tick 价，更新图表红线 ──
+        self._tick_updated.connect(self._on_tick_updated)
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._poll_tick)
+        self._tick_timer.start(2000)
+
         # 启动后立即拉一次数据 + 状态
         self._on_fetch_data()
+
+    def closeEvent(self, event) -> None:
+        """关闭窗口：停止定时器与后台线程，避免进程残留。"""
+        self._tick_timer.stop()
+        self._status_timer.stop()
+        self._auto_timer.stop()
+        super().closeEvent(event)
 
     # ── 48 小时时间级别：按周期换算需要拉取的K线根数 ─────────────────────
     def _window_bar_count(self, timeframe: str) -> int:
@@ -368,6 +393,58 @@ class MainWindow(QMainWindow):
         base = WINDOW_HOURS * 60 // minutes  # 48h 对应根数
         # 若用户在「其他设置」调大了K线数量则尊重用户配置（显示更多）
         return max(base, getattr(self._settings.general, "analysis_bar_count", 48))
+
+    # ── 十字光标工具：按钮开关（独立功能，不干扰拖拽/缩放/点击）───────────
+    def _on_crosshair_toggle(self, checked: bool) -> None:
+        """十字光标按钮点击：激活/关闭，带按钮视觉反馈。"""
+        self._chart.set_crosshair_enabled(checked)
+        if checked:
+            # 激活状态：按钮高亮 + 文字变关闭提示
+            self._crosshair_btn.setText("⛔ 关闭光标")
+            self._crosshair_btn.setStyleSheet(
+                "QPushButton{background-color:#1e3a5f;color:#e6edf3;"
+                "border:1px solid #3b82f6;border-radius:4px;padding:4px 10px;}"
+            )
+        else:
+            # 关闭状态：恢复默认样式（默认隐藏，不加载任何光标状态）
+            self._crosshair_btn.setText("➕ 十字光标")
+            self._crosshair_btn.setStyleSheet("")
+        self._kline_status.setText(f"十字光标: {'已开启' if checked else '已关闭'}")
+
+    # ── 实时价格标注：后台轮询 MT5 tick，更新图表红线 ─────────────────────
+    def _poll_tick(self) -> None:
+        """每 2 秒触发：后台线程取当前品种最新 tick 价（不阻塞 UI）。"""
+        if not self._chart._frame:  # 图表尚未加载数据则跳过，减少空转
+            return
+        symbol = self._sym_combo.currentText()
+        timeframe = self._tf_combo.currentText()
+        sym, tf = symbol, timeframe
+
+        def _work() -> None:
+            try:
+                import MetaTrader5 as mt5
+
+                if not mt5.initialize():
+                    return
+                try:
+                    mt5_sym = resolve_mt5_symbol(sym)
+                    tick = mt5.symbol_info_tick(mt5_sym)
+                    if tick is None:
+                        return
+                    # 最新成交价：优先 last（真实成交价），无 last 用买卖中间价
+                    price = tick.last if tick.last > 0 else (tick.bid + tick.ask) / 2.0
+                    if price > 0:
+                        self._tick_updated.emit(price)
+                finally:
+                    mt5.shutdown()
+            except Exception:
+                return  # 网络/数据瞬时异常静默跳过，下一轮重试
+
+        threading.Thread(target=_work, name="wkf-tick", daemon=True).start()
+
+    def _on_tick_updated(self, price: float) -> None:
+        """最新成交价到达（主线程）：更新图表红线与标签。"""
+        self._chart.set_last_price(price)
 
     def _on_selector_changed(self) -> None:
         """品种/周期变更：显示加载状态并防抖触发刷新。"""
