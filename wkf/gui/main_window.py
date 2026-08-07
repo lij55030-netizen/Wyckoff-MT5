@@ -180,6 +180,17 @@ class _AiChatWidget(QWidget):
         self.view.clear()
         self.view.setPlainText(plain_text)
 
+    def append_log(self, title: str, body_plain: str) -> None:
+        """追加一条分析日志（提交分析联动：完整推理过程 + Token 消耗）。"""
+        body_html = html.escape(body_plain).replace("\n", "<br>")
+        self.view.append(
+            f"<p style='margin:8px 0 2px;border-top:1px solid #2a3442;padding-top:6px'>"
+            f"<b style='color:#f59e0b'>📋 {html.escape(title)}</b></p>"
+            f"<div style='color:#e6edf3'>{body_html}</div>"
+        )
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def toPlainText(self) -> str:
         return self.view.toPlainText()
 
@@ -336,6 +347,9 @@ class MainWindow(QMainWindow):
         # 响应返回时若用户已切换，则丢弃过期结果，防止旧品种数据覆盖新图表
         self._fetch_req = ("", "")
         # K线收盘倒计时：1 秒定时器秒级实时刷新；MT5 时间戳每 5 秒校准一次（避免高频连接）
+        # 服务器时钟偏移：MT5 bar/tick 时间基于服务器时钟（实测比真实 UTC 快 3 小时），
+        # 与 time.time()（真实 UTC）不同基准，须测量偏移后对齐，否则倒计时偏差数小时
+        self._server_offset_ms = 0
         self._status_ts = 0
         self._status_ts_fetched_at = 0.0
         self._auto_timer = QTimer(self)
@@ -602,7 +616,9 @@ class MainWindow(QMainWindow):
         self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
         self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
         self._tab_decision.setHtml(self._render_decision_tab(wa))  # 富文本（红色粗体结论）
-        self._tab_ai.show_analysis(self._render_ai_tab(res, wa))   # 分析摘要作为对话首条
+        # 提交分析联动：在问AI面板自动追加一条完整分析日志（推理步骤 + Token 消耗）
+        title = f"{frame.symbol} {frame.timeframe} 分析日志"
+        self._tab_ai.append_log(title, self._render_ai_tab(res, wa))
 
     def _render_data_tab(self, frame) -> str:
         """数据标签页：分析了哪些数据（K线明细表，保留原实现供兼容）。"""
@@ -793,8 +809,13 @@ class MainWindow(QMainWindow):
         return "".join(p)
 
     def _render_ai_tab(self, res, wa) -> str:
-        """问AI标签页：AI 分析结论 + 概率 + 思考过程 + Token 统计。"""
+        """问AI标签页：AI 分析结论 + 概率 + 思考过程 + Token 统计。
+
+        未运行 AI（如仅获取数据）时，展示威科夫三层推理作为分析日志内容。
+        """
         if res is None or res.ai_diagnosis is None:
+            if wa is not None:
+                return "（本次未运行 AI 诊断）\n\n" + wa.render_text()
             return "尚未运行 AI 诊断。点击「📝 提交分析」以获取 AI 增强分析。"
         ai = res.ai_diagnosis
         lines = [
@@ -966,18 +987,49 @@ class MainWindow(QMainWindow):
             # 更新剩余时间显示
             self._update_kline_status()
 
+    def _measure_server_offset(self) -> int:
+        """测量 MT5 服务器时钟与真实 UTC 的偏移（毫秒）。
+
+        MT5 返回的 bar time / tick time_msc 均基于服务器时钟（本机实测快 3 小时，
+        对应 GTC 服务器 GMT+3），而 time.time() 是真实 UTC——两者基准不同，
+        直接相减会导致倒计时偏差数小时。取最新 tick 的 time_msc 与本地 UTC 之差作为偏移。
+        """
+        try:
+            import MetaTrader5 as mt5
+            from wkf.data.mt5_source import resolve_mt5_symbol
+
+            if not mt5.initialize():
+                return 0
+            sym = resolve_mt5_symbol(self._sym_combo.currentText())
+            now = int(time.time())
+            # 范围覆盖服务器时钟（真实 UTC + 数小时），取最新 tick
+            tks = mt5.copy_ticks_range(sym, now - 120, now + 4 * 3600, mt5.COPY_TICKS_ALL)
+            if tks is not None and len(tks) > 0:
+                return int(tks[-1]["time_msc"] - now * 1000)
+        except Exception:
+            pass
+        return 0
+
     def _update_kline_status(self) -> None:
         """K线收盘倒计时：1 秒定时器秒级实时刷新（修复原 5 秒刷新的滞后问题）。
 
         实现：MT5 最新K线时间戳每 5 秒校准一次（避免每秒高频连接），
         其余每秒用本地时间精确递减剩余收盘时间；
         K线完结（时间戳变化）时自动以新K线起点重置倒计时。
+
+        关键修复：K线时间戳基于 MT5 服务器时钟（与本地 UTC 有数小时时区偏移），
+        必须先用服务器偏移对齐"当前时刻"，否则剩余时间偏差数小时
+        （如 10 分钟K线显示成 185 分钟）。
         """
         if self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
         now_mono = time.monotonic()
+
+        # 首次测量服务器时钟偏移（缓存；服务器时区固定，一次即可）
+        if self._server_offset_ms == 0:
+            self._server_offset_ms = self._measure_server_offset()
 
         # 每 5 秒校准一次最新K线时间戳
         if now_mono - self._status_ts_fetched_at >= 5.0:
@@ -995,9 +1047,10 @@ class MainWindow(QMainWindow):
         if ts <= 0:
             return
         minutes = TF_MINUTES.get(timeframe, 15)
-        close_at = ts + minutes * 60 * 1000
-        now_ms = int(time.time() * 1000)
-        remain_s = max(0, int((close_at - now_ms) // 1000))
+        period_ms = minutes * 60 * 1000  # 单根K线周期（如 10m = 600 秒）
+        # 服务器时钟基准下的"当前时刻" = 真实 UTC + 服务器偏移
+        server_now_ms = int(time.time() * 1000) + self._server_offset_ms
+        remain_s = max(0, int((ts + period_ms - server_now_ms) // 1000))
         remain = f"{remain_s // 60}分{remain_s % 60}秒"
         if self._auto_active:
             self._kline_status.setText(f"♾ 持续跟踪中 · 当前K线 {remain} 后收盘")
