@@ -5,13 +5,17 @@
 """
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 
+sys.stdout.reconfigure(encoding="utf-8")  # 控制台 UTF-8，避免中文输出 GBK 报错
+
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 OWNER = "lij55030-netizen"
-REPO = "Wyckoff-MT5-Workbuddy"
+REPO = "Wyckoff-MT5"  # 2026-08 仓库已迁移（原 Wyckoff-MT5-Workbuddy 重定向到本地址）
 BASE = f"https://api.github.com/repos/{OWNER}/{REPO}"
+UPLOAD_BASE = f"https://uploads.github.com/repos/{OWNER}/{REPO}"  # 资产上传专用域名
 HDR = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
 
 if not TOKEN:
@@ -92,7 +96,7 @@ for path, ctype in assets:
         print(f"⚠️ 资产缺失，跳过: {path}")
         continue
     name = os.path.basename(path)
-    url = f"{BASE}/releases/{rel_id}/assets?name={urllib.parse.quote(name)}"
+    url = f"{UPLOAD_BASE}/releases/{rel_id}/assets?name={urllib.parse.quote(name)}"
     with open(path, "rb") as f:
         data = f.read()
     req = urllib.request.Request(url, data=data, headers={**HDR, "Content-Type": ctype}, method="POST")
