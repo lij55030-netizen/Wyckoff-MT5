@@ -8,16 +8,21 @@ import threading
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMenuBar,
     QPushButton,
     QPlainTextEdit,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -39,6 +44,59 @@ TIMEFRAMES = ["5m", "10m", "15m", "30m", "1h"]
 TF_MINUTES = {"5m": 5, "10m": 10, "15m": 15, "30m": 30, "1h": 60}
 # 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口）
 WINDOW_HOURS = 48
+
+
+class _KlineTableWidget(QWidget):
+    """数据标签页容器：顶部状态行 + K线明细表格（UI 展示优化版）。
+
+    仅做前端展示渲染，不涉及任何行情数据/指标计算/业务逻辑。
+    提供 toPlainText() 兼容方法，保持原纯文本表格的外部读取语义。
+    """
+
+    _HEADERS = ["#", "时间", "开", "高", "低", "收", "涨跌", "量", "RSI", "VWAP", "Δ"]
+    _WIDTHS = [40, 108, 62, 62, 62, 62, 52, 70, 66, 84, 58]  # 固定列宽
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color:#8b949e;font-size:12px;")
+        layout.addWidget(self.status_label)
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self._HEADERS))
+        self.table.setHorizontalHeaderLabels(self._HEADERS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)  # 斑马线
+        self.table.setShowGrid(False)
+        # 表头加深底色 + 斑马线浅底色 + 全局配色（绿涨红跌）
+        self.table.setStyleSheet(
+            "QTableWidget{background-color:#0f1419;color:#e6edf3;"
+            "alternate-background-color:#161d26;font-size:12px;border:1px solid #2a3442;}"
+            "QTableWidget::item{padding:2px 6px;}"
+            "QHeaderView::section{background-color:#1e2632;color:#8b949e;"
+            "border:1px solid #2a3442;padding:4px 8px;font-weight:bold;font-size:12px;}"
+        )
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)  # 固定列宽
+        for i, w in enumerate(self._WIDTHS):
+            self.table.setColumnWidth(i, w)
+        layout.addWidget(self.table)
+
+    def toPlainText(self) -> str:
+        """兼容方法：返回表格文本（供测试/外部读取，保持原文本表格语义）。"""
+        lines = [self.status_label.text()]
+        lines.append("序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 涨跌 | 成交量 | RSI | VWAP | Δ")
+        for r in range(self.table.rowCount()):
+            row = [
+                self.table.item(r, c).text() if self.table.item(r, c) else ""
+                for c in range(self.table.columnCount())
+            ]
+            lines.append(" | ".join(row))
+        return "\n".join(lines)
 
 
 class MainWindow(QMainWindow):
@@ -136,9 +194,10 @@ class MainWindow(QMainWindow):
 
         # 5 个标签页
         tabs = QTabWidget()
-        self._tab_data = QPlainTextEdit()
-        self._tab_data.setReadOnly(True)
-        self._tab_data.setMaximumBlockCount(2000)
+        # 数据标签页：状态行 + K线明细表格（UI 展示优化，_KlineTableWidget 自带 toPlainText 兼容）
+        self._tab_data = _KlineTableWidget()
+        self._table_status = self._tab_data.status_label
+        self._data_table = self._tab_data.table
         tabs.addTab(self._tab_data, "📊 数据")
 
         self._tab_snapshot = QPlainTextEdit()
@@ -203,7 +262,8 @@ class MainWindow(QMainWindow):
         tf = self._tf_combo.currentText()
         self._has_ai_result = False  # 新品种数据，旧 AI 结果作废
         self._kline_status.setText(f"⏳ 切换中，加载 {sym} {tf} ...")
-        self._tab_data.setPlainText(f"⏳ 正在加载 {sym} {tf}（48小时窗口）...")
+        self._set_table_status(f"⏳ 正在加载 {sym} {tf}（48小时窗口）...")
+        self._data_table.setRowCount(0)
         self._debounce_timer.start()
 
     def _append_history(self, symbol: str, timeframe: str, bias: str, report: str) -> None:
@@ -258,7 +318,7 @@ class MainWindow(QMainWindow):
         self._fetch_req = (symbol, timeframe)  # 记录请求令牌
         self._fetch_btn.setEnabled(False)
         bar_count = self._window_bar_count(timeframe)
-        self._tab_data.setPlainText(
+        self._set_table_status(
             f"⏳ 获取 {symbol} {timeframe} 数据（{WINDOW_HOURS}h 窗口，{bar_count} 根）..."
         )
 
@@ -277,7 +337,8 @@ class MainWindow(QMainWindow):
         if self._fetch_req != (self._sym_combo.currentText(), self._tf_combo.currentText()):
             return
         if err:
-            self._tab_data.setPlainText(f"❌ 获取失败: {err}")
+            self._set_table_status(f"❌ 获取失败: {err}")
+            self._data_table.setRowCount(0)
             self._kline_status.setText(f"❌ 获取失败: {err[:60]}")
             return
         if frame is not None:
@@ -287,9 +348,8 @@ class MainWindow(QMainWindow):
         if frame is not None and not getattr(self, "_has_ai_result", False):
             self._populate_tabs(frame, wa, None)
             hours = WINDOW_HOURS
-            self._tab_data.setPlainText(
-                f"✅ {frame.symbol} {frame.timeframe} 已更新（{hours}h 窗口，{len(frame.bars)} 根）\n\n"
-                + self._render_data_tab(frame)
+            self._set_table_status(
+                f"✅ 分析数据已更新（{frame.symbol} {frame.timeframe} · {hours}h 窗口 · {len(frame.bars)} 根K线）"
             )
         if frame is not None:
             latest_ts = datetime.datetime.fromtimestamp(frame.bars[0].ts_open / 1000).strftime("%H:%M")
@@ -301,7 +361,8 @@ class MainWindow(QMainWindow):
         self._fetch_req = (symbol, timeframe)  # 分析同样更新令牌
         self._analyze_btn.setEnabled(False)
         bar_count = self._window_bar_count(timeframe)
-        self._tab_data.setPlainText(f"⏳ 正在分析 {symbol} {timeframe}（{WINDOW_HOURS}h 窗口）...")
+        self._set_table_status(f"⏳ 正在分析 {symbol} {timeframe}（{WINDOW_HOURS}h 窗口）...")
+        self._data_table.setRowCount(0)
 
         def _work() -> None:
             res = run_analysis(
@@ -322,7 +383,8 @@ class MainWindow(QMainWindow):
             return
         self._has_ai_result = True
         if res.error:
-            self._tab_data.setPlainText(f"❌ 分析失败: {res.error}")
+            self._set_table_status(f"❌ 分析失败: {res.error}")
+            self._data_table.setRowCount(0)
             return
         if res.frame is not None:
             self._chart.set_frame(res.frame)
@@ -333,16 +395,113 @@ class MainWindow(QMainWindow):
         bias = res.wyckoff.bias if res.wyckoff is not None else ""
         self._append_history(res.symbol, res.timeframe, bias, res.to_report())
 
+    # ── K线明细表格：UI 展示优化（仅前端渲染，不改任何数据/业务逻辑）─────
+    def _set_table_status(self, text: str) -> None:
+        """数据标签页顶部状态行。"""
+        self._table_status.setText(text)
+
+    def _populate_data_table(self, frame) -> None:
+        """填充 K 线明细表格（最近 20 根，字段与原表格完全一致）。
+
+        展示规则（配色沿用项目绿涨红跌）：
+          · 涨跌列: 阳线 ↑绿 / 阴线 ↓红（移除文字）
+          · 成交量: 对比近 20 根均值, ≥1.2x 放量🔺 / ≤0.8x 缩量🔻 / 常态⚫
+          · RSI 列: >70 超买⚠️ / 30~70 常态●灰 / <30 超卖🔵
+          · Δ 列: 正数 ↑绿 / 负数 ↓红 / 0 值 —灰
+          · 收盘/VWAP/RSI 数值加粗高亮
+        """
+        if frame is None or not frame.bars:
+            self._data_table.setRowCount(0)
+            return
+        ind = frame.indicators
+        of = frame.orderflow
+        bars = frame.bars[:20]  # 与旧表格一致: 最近 20 根
+        vols = [b.volume for b in bars]
+        mean_vol = sum(vols) / len(vols) if vols else 0.0
+
+        n = len(bars)
+        self._data_table.setRowCount(n)
+        for i, b in enumerate(bars):
+            yang = b.close >= b.open
+            ts = datetime.datetime.fromtimestamp(b.ts_open / 1000).strftime("%m-%d %H:%M")
+            rsi = ind.rsi14[i] if i < len(ind.rsi14) and not math.isnan(ind.rsi14[i]) else None
+            vwap = ind.vwap[i] if i < len(ind.vwap) and not math.isnan(ind.vwap[i]) else None
+            delta = of.delta[i] if of and i < len(of.delta) and not math.isnan(of.delta[i]) else None
+
+            # 涨跌图标（阳↑绿 / 阴↓红）
+            trend_txt = "↑" if yang else "↓"
+            trend_color = "#22c55e" if yang else "#ef4444"
+            # 成交量图标（对比近 20 根均值）
+            ratio = b.volume / mean_vol if mean_vol else 1.0
+            vol_icon = "🔺" if ratio >= 1.2 else ("🔻" if ratio <= 0.8 else "⚫")
+            # RSI 状态图标
+            if rsi is None:
+                rsi_icon = "—"
+            elif rsi > 70:
+                rsi_icon = "⚠️"
+            elif rsi < 30:
+                rsi_icon = "🔵"
+            else:
+                rsi_icon = "●"
+            # Δ 差值
+            if delta is None:
+                d_txt, d_color = "—", "#8b949e"
+            elif delta > 0:
+                d_txt, d_color = f"↑{int(delta):+d}", "#22c55e"
+            elif delta < 0:
+                d_txt, d_color = f"↓{int(delta):+d}", "#ef4444"
+            else:
+                d_txt, d_color = "—", "#8b949e"
+
+            vals = [
+                (str(b.seq), "#8b949e", False),            # 序号
+                (ts, None, False),                          # 时间(左对齐)
+                (f"{b.open:.2f}", None, False),             # 开
+                (f"{b.high:.2f}", None, False),             # 高
+                (f"{b.low:.2f}", None, False),              # 低
+                (f"{b.close:.2f}", None, True),             # 收(加粗)
+                (trend_txt, trend_color, False),            # 涨跌
+                (f"{vol_icon}{int(b.volume)}", None, False),  # 量(图标+数值)
+                (f"{rsi:.1f} {rsi_icon}" if rsi is not None else f"— {rsi_icon}", None, True),  # RSI(加粗)
+                (f"{vwap:.2f}" if vwap is not None else "—", None, True),  # VWAP(加粗)
+                (d_txt, d_color, False),                    # Δ
+            ]
+            for col, (text, color, bold) in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if col == 1:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if color:
+                    item.setForeground(QColor(color))
+                if bold:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self._data_table.setItem(i, col, item)
+
+    def toPlainText(self) -> str:
+        """兼容方法：返回表格文本（供测试/外部读取，保持原文本表格语义）。"""
+        lines = [self._table_status.text()]
+        lines.append("序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 涨跌 | 成交量 | RSI | VWAP | Δ")
+        for r in range(self._data_table.rowCount()):
+            row = [
+                self._data_table.item(r, c).text() if self._data_table.item(r, c) else ""
+                for c in range(self._data_table.columnCount())
+            ]
+            lines.append(" | ".join(row))
+        return "\n".join(lines)
+
     # ── 标签页内容渲染 ────────────────────────────────────────────────────
     def _populate_tabs(self, frame, wa, res) -> None:
-        self._tab_data.setPlainText(self._render_data_tab(frame))
+        self._populate_data_table(frame)
         self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
         self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
         self._tab_decision.setPlainText(self._render_decision_tab(wa))
         self._tab_ai.setPlainText(self._render_ai_tab(res, wa))
 
     def _render_data_tab(self, frame) -> str:
-        """数据标签页：分析了哪些数据（K线明细表）。"""
+        """数据标签页：分析了哪些数据（K线明细表，保留原实现供兼容）。"""
         if frame is None or not frame.bars:
             return "无数据"
         lines = [
