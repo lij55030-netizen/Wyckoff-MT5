@@ -151,7 +151,7 @@ shot("06_获取数据后", win)
 data_txt = win._tab_data.toPlainText()
 record("获取数据-数据页更新", "分析数据" in data_txt or "数据已更新" in data_txt,
        f"数据页前50字: {data_txt[:50]!r}")
-record("获取数据-图表渲染", len(win._chart._items) >= 5, f"图表 items: {len(win._chart._items)}(批量渲染)")
+record("获取数据-图表渲染", len(win._chart._items) > 100, f"图表 items: {len(win._chart._items)}")
 
 # ── 测试项6：📝 提交分析按钮（完整管线含 AI）────────────────────────────
 win._on_analyze()
