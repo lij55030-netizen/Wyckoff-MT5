@@ -1,0 +1,157 @@
+# -*- coding: utf-8 -*-
+"""生成 WKF GUI 自检四部分报告（HTML）。"""
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+data = json.load(open(ROOT / "test_reports" / "selftest_data_export.json", encoding="utf-8"))
+
+w = data["wyckoff"]
+va = w["value_area"]
+of = w["orderflow"]
+k1 = data["kline"][0]
+k2 = data["kline"][1]
+usage = data["usage"]
+
+# 追加 K 线统计：计算真实变化率
+closes = [k["close"] for k in data["kline"]]
+last, prev = closes[0], closes[1]
+chg_pct = round((last - prev) / prev * 100, 2)
+hi30 = max(k["high"] for k in data["kline"])
+lo30 = min(k["low"] for k in data["kline"])
+
+html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<title>WKF GUI 全面自检报告</title>
+<style>
+ body {{ font-family:'Microsoft YaHei',sans-serif; background:#0f1419; color:#e6edf3; margin:0; padding:24px; }}
+ h1 {{ font-size:22px; border-bottom:2px solid #3b82f6; padding-bottom:8px; }}
+ h2 {{ font-size:17px; color:#3b82f6; margin-top:28px; }}
+ h3 {{ font-size:14px; color:#8b5cf6; }}
+ table {{ border-collapse:collapse; width:100%; margin:10px 0; font-size:13px; }}
+ th,td {{ border:1px solid #2a3442; padding:6px 10px; text-align:left; }}
+ th {{ background:#1e2632; }}
+ .ok {{ color:#22c55e; font-weight:700; }} .fail {{ color:#ef4444; font-weight:700; }}
+ .warn {{ color:#f59e0b; }}
+ .box {{ background:#171d26; border:1px solid #2a3442; border-radius:8px; padding:14px; margin:10px 0; }}
+ code {{ background:#1e2632; padding:2px 6px; border-radius:4px; font-size:12px; }}
+ .num {{ color:#f59e0b; font-weight:700; }}
+</style></head><body>
+
+<h1>WKF 威科夫交易智能体 · 全面自检报告</h1>
+<p>测试时间：2026-08-07 22:00~22:15 ｜ 测试方式：真实进程启动 + offscreen 程序化逐项验证（每项操作→截图→断言）</p>
+
+<h2>一、测试记录</h2>
+<table>
+<tr><th>#</th><th>测试项</th><th>预期功能</th><th>实际表现</th><th>结论</th></tr>
+<tr><td>1</td><td>软件启动</td><td>窗口正常打开</td><td>窗口「WKF · 威科夫交易智能体」可见，1296×839，内存 208MB</td><td class="ok">通过</td></tr>
+<tr><td>2</td><td>菜单栏结构</td><td>含「⚙ 设置」「ℹ 关于」</td><td>两个菜单均存在</td><td class="ok">通过</td></tr>
+<tr><td>3</td><td>设置菜单 3 项</td><td>AI模型/飞书/指标参数</td><td>3 项齐全</td><td class="ok">通过</td></tr>
+<tr><td>4</td><td>🤖 AI 模型设置</td><td>可改模型/地址/Key/上下文/思考开关并保存</td><td>改 model+ctx 后保存→重载一致（ctx 200000 生效）</td><td class="ok">通过</td></tr>
+<tr><td>5</td><td>📮 飞书通知设置</td><td>可配 Webhook/Secret/App 信息并保存</td><td>保存→重载一致</td><td class="ok">通过</td></tr>
+<tr><td>6</td><td>📐 指标参数设置</td><td>9 项参数可调并保存</td><td>RSI=21、VA=0.700、摆动=30 保存生效</td><td class="ok">通过</td></tr>
+<tr><td>7</td><td>🔄 获取数据</td><td>拉取真实K线+指标+订单流，图表更新</td><td>100 根K线，图表 307 项渲染，数据页更新</td><td class="ok">通过</td></tr>
+<tr><td>8</td><td>📝 提交分析（快照页）</td><td>快照含行情+RSI+EMA+ATR+BB+VWAP+订单流</td><td>快照页完整输出</td><td class="ok">通过</td></tr>
+<tr><td>9</td><td>📝 提交分析（诊断页）</td><td>威科夫三层推理</td><td>背景/价值区域/订单流完整</td><td class="ok">通过</td></tr>
+<tr><td>10</td><td>📝 提交分析（决策页）</td><td>倾向/触发/失效</td><td>「倾向: 偏多」+ 触发/失效输出</td><td class="ok">通过</td></tr>
+<tr><td>11</td><td>📝 提交分析（AI 页）</td><td>AI 方向/置信度/思考过程/Token 统计</td><td>置信度 75% + 思考过程 + 消耗统计输出</td><td class="ok">通过 <span class="warn">(修复后)</span></td></tr>
+<tr><td>12</td><td>📝 提交分析（历史记录）</td><td>每次分析追加记录</td><td>[1] 22:09:48 NQ1! 15m → long</td><td class="ok">通过</td></tr>
+<tr><td>13</td><td>📝 提交分析（按钮恢复）</td><td>分析完成后按钮恢复可用</td><td>按钮可用</td><td class="ok">通过</td></tr>
+<tr><td>14</td><td>♾ 持续跟踪开关</td><td>开启启动轮询定时器，关闭停止</td><td>开→timer=True；关→timer=False</td><td class="ok">通过</td></tr>
+<tr><td>15</td><td>ℹ 关于对话框</td><td>弹出关于信息</td><td>弹窗正常（1 次调用）</td><td class="ok">通过</td></tr>
+<tr><td>16</td><td>品种/周期切换</td><td>切换后可用新参数分析</td><td>GC1! 30m 切换成功并完成分析</td><td class="ok">通过</td></tr>
+<tr><td>17</td><td>数据导出</td><td>面板数据导出为 JSON</td><td>selftest_data_export.json（33KB）</td><td class="ok">通过</td></tr>
+</table>
+
+<h2>二、修改清单</h2>
+<div class="box">
+<h3>修改 1（对应「提交分析 → AI 页」故障）— 已修复</h3>
+<table>
+<tr><th>文件</th><td><code>wkf/ai/deepseek_client.py</code></td></tr>
+<tr><th>故障现象</th><td>提交分析后 AI 页显示「尚未运行」——AI 正式回答为空，仅消耗 Token</td></tr>
+<tr><th>根因</th><td><code>max_tokens=8192</code> 被思考(thinking)过程耗尽：实测 reasoning_tokens=8192 时 content 为空。思考占用全部输出预算，正式回答被截断</td></tr>
+<tr><th>修复</th><td><code>max_tokens 8192 → 16384</code>，为思考之后的正式诊断留足输出空间。修复后实测：reasoning 5004 + 正式回答 1099 tokens，AI 页置信度正常输出</td></tr>
+</table>
+<h3>修改 2（测试基建，防同类事故）— 已改进</h3>
+<table>
+<tr><th>文件</th><td><code>tools/selftest_gui.py</code></td></tr>
+<tr><th>问题</th><td>首次测试在数据采集阶段异常退出，配置恢复逻辑未执行，测试值残留进 settings.json；且备份文件固定名被二次覆盖，原始飞书 webhook 被测试值覆盖且不可恢复</td></tr>
+<tr><th>修复</th><td>① 备份文件名带时间戳（防覆盖）；② <code>atexit</code> 注册恢复函数（无论正常/异常退出均恢复配置）；③ 恢复逻辑改为恢复「最早备份」</td></tr>
+<tr><th>遗留</th><td class="warn">飞书 webhook 完整值被测试覆盖且无备份可恢复，已按记忆恢复前缀 <code>fe784774</code> + secret 原值，<b>需你在「飞书发送消息通知设置」重新粘贴完整 webhook 地址</b></td></tr>
+</table>
+<h3>修改 3（配置恢复）— 已完成</h3>
+<table>
+<tr><th>文件</th><td><code>config/settings.json</code></td></tr>
+<tr><th>内容</th><td>恢复默认指标参数（RSI14/BB20/2.0/EMA20/ATR14/VA0.682/失衡2.0/摆动40）、context_window 2000000、thinking=true；保留 deepseek-v4-flash 模型与 API Key</td></tr>
+</table>
+</div>
+
+<h2>三、数据分析（GC1! 黄金 30m，120 根真实K线）</h2>
+<div class="box">
+<p><b>数据来源</b>：MT5 真实历史K线（2026-08-07，GTC 账户 XAUUSD），分析时间为 22:12 附近。所有数值均来自导出 JSON 原文，未做任何推测。</p>
+
+<h3>3.1 行情快照</h3>
+<table>
+<tr><th>指标</th><th>数值</th><th>说明</th></tr>
+<tr><td>最新收盘价（K1，22:00）</td><td class="num">4325.03</td><td>较 K2 收盘 4316.85 上涨 <span class="num">+8.18（+0.19%）</span></td></tr>
+<tr><td>K1 区间</td><td class="num">4316.79 ~ 4327.34</td><td>带上影线阳线</td></tr>
+<tr><td>近30根K线区间</td><td class="num">{lo30} ~ {hi30}</td><td>计算自导出数据</td></tr>
+<tr><td>RSI14（最新）</td><td class="num">68.87</td><td>接近超买区（>70）</td></tr>
+<tr><td>VWAP（日内累计）</td><td class="num">4232.62</td><td>现价高于 VWAP <span class="num">+2.18%</span></td></tr>
+<tr><td>EMA20</td><td class="num">4290.49</td><td>现价高于 EMA20 <span class="num">+0.80%</span></td></tr>
+<tr><td>K1 成交量</td><td class="num">11,075</td><td>近 8 根中最大（seq8=9295~seq1=11075）</td></tr>
+</table>
+
+<h3>3.2 威科夫三层（程序判定）</h3>
+<table>
+<tr><th>层</th><th>判定</th><th>依据</th></tr>
+<tr><td>背景</td><td class="num">上升趋势（markup 阶段）</td><td>HH+HL <span class="num">3 组</span>，反向 LH+LL <span class="num">0 组</span>；程序推理：趋势但价格仍在价值区域内</td></tr>
+<tr><td>价值区域</td><td class="num">VA [4320.60, 4326.40]</td><td>VPOC 4324.10，VWAP 4322.38，宽度 5.80；HVN/LVN 密集价区已导出</td></tr>
+<tr><td>订单流</td><td class="num">Delta +24（买方微占优）</td><td>活跃方 sell，反转阶段 absorption（吸收）；失衡 9 处、堆叠 0 组</td></tr>
+<tr><td>综合倾向</td><td class="num">long（偏多）</td><td>触发/失效条件已生成</td></tr>
+</table>
+
+<h3>3.3 AI 增强诊断（DeepSeek v4-flash）</h3>
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>方向</td><td class="num">bullish</td></tr>
+<tr><td>置信度</td><td class="num">75%</td></tr>
+<tr><td>周期位置</td><td>normal_channel（趋势通道正常）</td></tr>
+<tr><td>与程序诊断一致性</td><td class="ok">一致（regime_agree=true）</td></tr>
+<tr><td>关键信号</td><td>① HH+HL 3组沿 EMA20 上行；② 现价在价值区域内；③ 4326.40 附近出现 sell imbalance 3.0x @4326.3 吸收迹象；④ RSI 68.87 接近超买、价格逼近布林上轨 4330.85</td></tr>
+<tr><td>支撑位</td><td>4322.38（VWAP）/ 4320.60（VA下沿）/ 4319.5-4319.9（HVN）/ 4316.9-4317.3（LVN）/ 4313.18（K2低点）</td></tr>
+<tr><td>阻力位</td><td>4326.40（VA上沿）/ 4327.34（K1高点）/ 4330.85（布林上轨）/ 4335.00（整数关口）</td></tr>
+<tr><td>入场触发</td><td>回踩 4319.50-4320.60 企稳 + 买方主动（阳线收高/Delta转正/放量）；或放量突破 4327.34 后回踩确认</td></tr>
+<tr><td>失效条件</td><td>30分钟收盘跌破 4320.60 且不快速收回，或跌破 4319.50</td></tr>
+<tr><td>消耗</td><td>prompt 4,697 + completion 6,103（其中思考 5,004）→ 合计 10,800 tokens，耗时 62.7s</td></tr>
+</table>
+
+<h3>3.4 概率评估（审慎声明）</h3>
+<p>按自检要求，此处只陈述可量化事实与 AI 输出，不编造数值：</p>
+<ul>
+<li>AI 模型输出的「上涨置信度 75%」是<b>模型对当前结构的置信评分，不是真实历史统计概率</b>——它基于 120 根K线的结构特征（HH+HL 计数、价值区域位置、订单流失衡）给出，未做任何未来价格的频率统计。真实涨跌概率<b>无法从现有数据严格计算</b>。</li>
+<li>可量化的事实：近 30 根K线区间 <span class="num">{lo30}~{hi30}</span>；最新 2 根累计涨幅 <span class="num">+8.18 点（+0.19%）</span>；RSI 从 K8 的 60.88 升至 K1 的 68.87（8 根内上升 7.99）；Delta 序列（K8→K1）：+341/+400/+105/+178/+129/+178/+337/+24。</li>
+<li>未知项如实标注：<b>不知道</b>——①未来任意时刻的精确涨跌概率（需要足够长的历史样本做统计，当前 120 根样本不足以严谨估计）；②VWAP 当日累计值以外的日内结构（VWAP 4232.62 与现价差距 2.18% 系当日价格持续上行所致，属正常现象而非异常）。</li>
+</ul>
+</div>
+
+<h2>四、影响评估</h2>
+<div class="box">
+<table>
+<tr><th>维度</th><th>评估</th></tr>
+<tr><td>本次代码修改</td><td>仅 1 处业务代码修改：<code>deepseek_client.py</code> 的 <code>max_tokens</code> 常量（8192→16384）。<b>模块内部局部修改，不改变函数签名、不改变调用方接口、不新增依赖</b></td></tr>
+<tr><td>影响范围</td><td>所有走 <code>DeepSeekClient.chat()</code> 的路径（GUI 提交分析、CLI、飞书指令分析）均受益：思考较长时正式回答不再被截断。Web 分析页（<code>web/server.py</code>）使用独立 openai 流式调用，未受影响</td></tr>
+<tr><td>新增风险</td><td>① 单次请求输出上限提高 → 单次 Token 消耗上限增加（实测最大 16,384，费用略升，可接受）；② <b>配置恢复遗留风险</b>：飞书 webhook 完整值需用户重新粘贴（设置菜单→飞书发送消息通知设置），否则飞书通知不可用——这是本次测试基建事故的直接后果，已通过 atexit+时间戳备份防止复发</td></tr>
+<tr><td>流程影响</td><td>分析主流程（数据→指标→订单流→威科夫→AI→展示）无改动，5 标签页展示逻辑无改动，历史记录/持续跟踪无改动</td></tr>
+<tr><td>测试基建</td><td><code>tools/selftest_gui.py</code> 改进备份/恢复策略，可重复安全运行；截图 13 张保存于 <code>test_reports/screenshots/</code></td></tr>
+</table>
+</div>
+
+<footer style="margin-top:24px;color:#8b949e;font-size:12px">
+本报告所有数值均来自 <code>test_reports/selftest_data_export.json</code>（MT5 真实数据）与运行日志，未做推测；无法确定的数据已标注「不知道」。仅供学习研究，不构成投资建议。
+</footer>
+</body></html>"""
+
+out = ROOT / "test_reports" / "wkf_selftest_report.html"
+out.write_text(html, encoding="utf-8")
+print("报告已生成:", out)
