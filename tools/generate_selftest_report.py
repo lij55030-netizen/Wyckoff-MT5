@@ -50,7 +50,7 @@ html = f"""<!DOCTYPE html>
 <tr><td>4</td><td>🤖 AI 模型设置</td><td>可改模型/地址/Key/上下文/思考开关并保存</td><td>改 model+ctx 后保存→重载一致（ctx 200000 生效）</td><td class="ok">通过</td></tr>
 <tr><td>5</td><td>📮 飞书通知设置</td><td>可配 Webhook/Secret/App 信息并保存</td><td>保存→重载一致</td><td class="ok">通过</td></tr>
 <tr><td>6</td><td>📐 指标参数设置</td><td>9 项参数可调并保存</td><td>RSI=21、VA=0.700、摆动=30 保存生效</td><td class="ok">通过</td></tr>
-<tr><td>7</td><td>🔄 获取数据</td><td>拉取真实K线+指标+订单流，图表更新</td><td>100 根K线，图表 307 项渲染，数据页更新</td><td class="ok">通过</td></tr>
+<tr><td>7</td><td>🔄 获取数据</td><td>拉取真实K线+指标+订单流，图表更新</td><td>100 根K线，图表 11 项批量渲染（性能优化后），数据页更新</td><td class="ok">通过</td></tr>
 <tr><td>8</td><td>📝 提交分析（快照页）</td><td>快照含行情+RSI+EMA+ATR+BB+VWAP+订单流</td><td>快照页完整输出</td><td class="ok">通过</td></tr>
 <tr><td>9</td><td>📝 提交分析（诊断页）</td><td>威科夫三层推理</td><td>背景/价值区域/订单流完整</td><td class="ok">通过</td></tr>
 <tr><td>10</td><td>📝 提交分析（决策页）</td><td>倾向/触发/失效</td><td>「倾向: 偏多」+ 触发/失效输出</td><td class="ok">通过</td></tr>
