@@ -1,12 +1,13 @@
-"""WKF 主窗口：图表 + 控制 + 分析结果面板。"""
+"""WKF 主窗口：图表 + 控制 + 分析结果面板（数据/快照/诊断/决策/问AI）。"""
 from __future__ import annotations
 
 import datetime
+import math
 import sys
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QMetaObject, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -26,6 +28,7 @@ from wkf.data.base import KlineFrame
 from wkf.gui.chart_widget import WkfChart
 from wkf.gui.settings_dialogs import AIModelDialog, FeishuDialog, IndicatorDialog
 from wkf.orchestrator.runner import (
+    AnalysisResult,
     fetch_frame_only,
     get_latest_bar_ts,
     run_analysis,
@@ -37,12 +40,19 @@ TF_MINUTES = {"5m": 5, "10m": 10, "15m": 15, "30m": 30, "1h": 60}
 
 
 class MainWindow(QMainWindow):
+    # 工作线程 → UI 线程信号（PyQt6 线程安全回调）
+    _fetch_done = pyqtSignal(object, object, str)  # frame, wyckoff, err
+    _analysis_done = pyqtSignal(object)  # AnalysisResult
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("WKF · 威科夫交易智能体")
-        self.resize(1200, 760)
+        self.resize(1280, 800)
 
         self._settings = load_settings()
+        self._fetch_done.connect(self._on_fetch_done)
+        self._analysis_done.connect(self._on_analysis_done)
+
 
         # ── 菜单栏 ─────────────────────────────────────────────────────────
         menubar = self.menuBar()
@@ -94,12 +104,12 @@ class MainWindow(QMainWindow):
         ctrl.addStretch(1)
         root.addLayout(ctrl)
 
-        # ── 图表 + 分析结果面板（历史 + 详情）────────────────────────────
+        # ── 图表 + 分析结果面板（历史 + 标签页）────────────────────────────
         split = QSplitter(Qt.Orientation.Vertical)
         self._chart = WkfChart()
         split.addWidget(self._chart)
 
-        # 结果区：左侧历史记录列表 + 右侧分析详情
+        # 结果区：左侧历史记录列表 + 右侧标签页（数据/快照/诊断/决策/问AI）
         result_split = QSplitter(Qt.Orientation.Horizontal)
 
         history_panel = QWidget()
@@ -113,21 +123,49 @@ class MainWindow(QMainWindow):
         hist_layout.addWidget(self._history_list)
         result_split.addWidget(history_panel)
 
-        self._result = QPlainTextEdit()
-        self._result.setReadOnly(True)
-        self._result.setMaximumBlockCount(2000)
-        result_split.addWidget(self._result)
+        # 5 个标签页
+        tabs = QTabWidget()
+        self._tab_data = QPlainTextEdit()
+        self._tab_data.setReadOnly(True)
+        self._tab_data.setMaximumBlockCount(2000)
+        tabs.addTab(self._tab_data, "📊 数据")
+
+        self._tab_snapshot = QPlainTextEdit()
+        self._tab_snapshot.setReadOnly(True)
+        self._tab_snapshot.setMaximumBlockCount(2000)
+        tabs.addTab(self._tab_snapshot, "📸 快照")
+
+        self._tab_diagnosis = QPlainTextEdit()
+        self._tab_diagnosis.setReadOnly(True)
+        self._tab_diagnosis.setMaximumBlockCount(2000)
+        tabs.addTab(self._tab_diagnosis, "🔍 诊断")
+
+        self._tab_decision = QPlainTextEdit()
+        self._tab_decision.setReadOnly(True)
+        self._tab_decision.setMaximumBlockCount(2000)
+        tabs.addTab(self._tab_decision, "🎯 决策")
+
+        self._tab_ai = QPlainTextEdit()
+        self._tab_ai.setReadOnly(True)
+        self._tab_ai.setMaximumBlockCount(3000)
+        tabs.addTab(self._tab_ai, "🤖 问AI")
+
+        result_split.addWidget(tabs)
         result_split.setSizes([170, 630])
 
         split.addWidget(result_split)
         split.setSizes([500, 220])
         root.addWidget(split, stretch=1)
 
+        # 兼容旧引用
+        self._result = self._tab_diagnosis
+
         # ── 自动分析状态 ───────────────────────────────────────────────────
         self._auto_active = False
         self._last_bar_ts = 0
         self._analysis_busy = False
         self._history_count = 0
+        self._has_ai_result = False
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_check_kline)
         self._status_timer = QTimer(self)
@@ -187,59 +225,199 @@ class MainWindow(QMainWindow):
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
         self._fetch_btn.setEnabled(False)
-        self._result.setPlainText(f"⏳ 获取 {symbol} {timeframe} 数据...")
+        self._tab_data.setPlainText(f"⏳ 获取 {symbol} {timeframe} 数据...")
 
         def _work() -> None:
             frame, wa, err = fetch_frame_only(
                 symbol, timeframe, settings=self._settings
             )
-
-            def _update() -> None:
-                self._fetch_btn.setEnabled(True)
-                if err:
-                    self._result.setPlainText(f"❌ 获取失败: {err}")
-                    return
-                if frame is not None:
-                    self._chart.set_frame(frame)
-                # 记录最新 bar 时间戳（自动分析基准）
-                if frame is not None and frame.bars:
-                    self._last_bar_ts = frame.bars[0].ts_open
-                if wa is not None:
-                    self._result.setPlainText(
-                        "✅ 数据已更新（未跑 AI）\n\n" + wa.render_text()
-                    )
-
-            QMetaObject.invokeMethod(self, _update, Qt.ConnectionType.QueuedConnection)
+            self._fetch_done.emit(frame, wa, err)
 
         threading.Thread(target=_work, name="wkf-fetch", daemon=True).start()
+
+    def _on_fetch_done(self, frame, wa, err: str) -> None:
+        """获取数据完成（主线程）。"""
+        self._fetch_btn.setEnabled(True)
+        if err:
+            self._tab_data.setPlainText(f"❌ 获取失败: {err}")
+            return
+        if frame is not None:
+            self._chart.set_frame(frame)
+            self._last_bar_ts = frame.bars[0].ts_open
+        # 仅当尚无 AI 分析结果时才填充各页，避免覆盖已完成的 AI 诊断
+        if frame is not None and not getattr(self, "_has_ai_result", False):
+            self._populate_tabs(frame, wa, None)
+            self._tab_data.setPlainText(
+                f"✅ 数据已更新（未跑 AI，可点「📝 提交分析」）\n\n" + self._render_data_tab(frame)
+            )
 
     def _on_analyze(self) -> None:
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
         self._analyze_btn.setEnabled(False)
-        self._result.setPlainText(f"⏳ 正在分析 {symbol} {timeframe} ...")
+        self._tab_data.setPlainText(f"⏳ 正在分析 {symbol} {timeframe} ...")
 
         def _work() -> None:
             res = run_analysis(symbol, timeframe, settings=self._settings, with_ai=True)
-            report = res.to_report()
-
-            def _update() -> None:
-                self._analyze_btn.setEnabled(True)
-                self._result.setPlainText(report)
-                if res.frame is not None:
-                    self._chart.set_frame(res.frame)
-                    self._last_bar_ts = res.frame.bars[0].ts_open
-                # 分析结果加入历史面板
-                bias = ""
-                if res.wyckoff is not None:
-                    bias = res.wyckoff.bias
-                self._append_history(symbol, timeframe, bias, report)
-                self._analysis_busy = False
-
-            QMetaObject.invokeMethod(self, _update, Qt.ConnectionType.QueuedConnection)
+            self._analysis_done.emit(res)
 
         self._analysis_busy = True
         threading.Thread(target=_work, name="wkf-analysis", daemon=True).start()
+
+    def _on_analysis_done(self, res: AnalysisResult) -> None:
+        """分析完成（主线程）。"""
+        self._analyze_btn.setEnabled(True)
+        self._analysis_busy = False
+        self._has_ai_result = True
+        if res.error:
+            self._tab_data.setPlainText(f"❌ 分析失败: {res.error}")
+            return
+        if res.frame is not None:
+            self._chart.set_frame(res.frame)
+            self._last_bar_ts = res.frame.bars[0].ts_open
+        # 填充 5 个标签页
+        self._populate_tabs(res.frame, res.wyckoff, res)
+        # 历史记录
+        bias = res.wyckoff.bias if res.wyckoff is not None else ""
+        self._append_history(res.symbol, res.timeframe, bias, res.to_report())
+
+    # ── 标签页内容渲染 ────────────────────────────────────────────────────
+    def _populate_tabs(self, frame, wa, res) -> None:
+        self._tab_data.setPlainText(self._render_data_tab(frame))
+        self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
+        self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
+        self._tab_decision.setPlainText(self._render_decision_tab(wa))
+        self._tab_ai.setPlainText(self._render_ai_tab(res, wa))
+
+    def _render_data_tab(self, frame) -> str:
+        """数据标签页：分析了哪些数据（K线明细表）。"""
+        if frame is None or not frame.bars:
+            return "无数据"
+        lines = [
+            f"=== 分析数据（{frame.symbol} {frame.timeframe}，共 {len(frame.bars)} 根K线）===",
+            "",
+            "序号 | 时间 | 开盘 | 最高 | 最低 | 收盘 | 阳阴 | 量 | RSI | VWAP | Δ",
+            "-----|------|------|------|------|------|------|----|-----|------|-----",
+        ]
+        ind = frame.indicators
+        of = frame.orderflow
+        for i in range(min(20, len(frame.bars))):
+            b = frame.bars[i]
+            import datetime as _dt
+
+            ts = _dt.datetime.fromtimestamp(b.ts_open / 1000).strftime("%m-%d %H:%M")
+            yang = "阳" if b.close > b.open else "阴"
+            rsi = ind.rsi14[i] if i < len(ind.rsi14) and not math.isnan(ind.rsi14[i]) else "-"
+            vwap = ind.vwap[i] if i < len(ind.vwap) and not math.isnan(ind.vwap[i]) else "-"
+            d = of.delta[i] if of and i < len(of.delta) and not math.isnan(of.delta[i]) else "-"
+            rsi_s = f"{rsi:.1f}" if isinstance(rsi, float) else "-"
+            vwap_s = f"{vwap:.2f}" if isinstance(vwap, float) else "-"
+            d_s = f"{d:+.0f}" if isinstance(d, float) else "-"
+            lines.append(
+                f"{b.seq:<4} | {ts} | {b.open:.2f} | {b.high:.2f} | {b.low:.2f} | "
+                f"{b.close:.2f} | {yang} | {b.volume:.0f} | {rsi_s} | {vwap_s} | {d_s}"
+            )
+        return "\n".join(lines)
+
+    def _render_snapshot_tab(self, frame, wa) -> str:
+        """快照标签页：当前行情快照。"""
+        if frame is None or not frame.bars:
+            return "无数据"
+        latest = frame.bars[0]
+        ind = frame.indicators
+        of = frame.orderflow
+        lines = [
+            f"=== 行情快照（{frame.symbol} {frame.timeframe}）===",
+            "",
+            f"最新价:   {latest.close:.2f}",
+            f"K线区间: {latest.low:.2f} - {latest.high:.2f}",
+            f"成交量:   {latest.volume:.0f}",
+            "",
+            "── 技术指标 ──",
+            f"RSI14:   {ind.rsi14[0]:.1f}" if not math.isnan(ind.rsi14[0]) else "RSI14:  -",
+            f"EMA20:   {ind.ema20[0]:.2f}" if not math.isnan(ind.ema20[0]) else "EMA20:  -",
+            f"ATR14:   {ind.atr14[0]:.2f}" if not math.isnan(ind.atr14[0]) else "ATR14:  -",
+            f"BB:      [{ind.bb_lower[0]:.2f}, {ind.bb_upper[0]:.2f}]",
+            f"VWAP:    {ind.vwap[0]:.2f}" if not math.isnan(ind.vwap[0]) else "VWAP:   -",
+        ]
+        if of is not None:
+            lines += [
+                "",
+                "── 订单流 ──",
+                f"Delta:   {of.delta[0]:+.0f}" if not math.isnan(of.delta[0]) else "Delta:  -",
+                f"累积Δ:   {of.cumulative_delta[0]:+.0f}",
+                f"POC:     {of.poc_price[0]:.2f}",
+                f"VA:      [{of.val[0]:.2f}, {of.vah[0]:.2f}]",
+            ]
+        return "\n".join(lines)
+
+    def _render_diagnosis_tab(self, frame, wa) -> str:
+        """诊断标签页：为什么这么分析（威科夫三层推理）。"""
+        if wa is None:
+            return "未分析"
+        lines = [wa.render_text()]
+        return "\n".join(lines)
+
+    def _render_decision_tab(self, wa) -> str:
+        """决策标签页：结果是什么（倾向/触发/失效/概率）。"""
+        if wa is None:
+            return "未分析"
+        bias_zh = {"long": "偏多", "short": "偏空", "neutral": "中性观望"}.get(wa.bias, wa.bias)
+        lines = [
+            "=== 交易决策 ===",
+            "",
+            f"🎯 倾向:   {bias_zh}",
+            f"📈 入场触发: {wa.trigger}",
+            f"🚫 失效条件: {wa.invalidation}",
+        ]
+        if wa.orderflow is not None:
+            of = wa.orderflow
+            lines += [
+                "",
+                "── 订单流支撑 ──",
+                f"活跃方: {of.active_side} | 反转阶段: {of.reversal_stage}",
+                f"失衡: {len(of.imbalances)} 处 | 堆叠: {len(of.stacked_imbalances)} 组",
+            ]
+        if wa.notes:
+            lines += ["", "── 备注 ──", *[f"· {n}" for n in wa.notes]]
+        return "\n".join(lines)
+
+    def _render_ai_tab(self, res, wa) -> str:
+        """问AI标签页：AI 分析结论 + 概率。"""
+        if res is None or res.ai_diagnosis is None:
+            return "尚未运行 AI 诊断。点击「📝 提交分析」以获取 AI 增强分析。"
+        ai = res.ai_diagnosis
+        lines = [
+            "=== AI 分析（DeepSeek）===",
+            "",
+            f"方向: {ai.get('direction', '?')}",
+            f"置信度: {ai.get('diagnosis_confidence', '?')}%（概率）",
+            f"周期: {ai.get('cycle_position', '?')}",
+            "",
+            "── 关键信号（为什么这么分析）──",
+        ]
+        for s in (ai.get("key_signals") or []):
+            lines.append(f"· {s}")
+        if ai.get("wyckoff_check"):
+            wk = ai["wyckoff_check"]
+            agree = "一致 ✅" if wk.get("regime_agree") else "分歧 ⚠️"
+            lines += ["", f"与程序诊断: {agree}", wk.get("note", "")]
+        plan = ai.get("trade_plan") or {}
+        if plan:
+            lines += [
+                "",
+                "── 交易计划 ──",
+                f"倾向: {plan.get('bias', '?')}",
+                f"触发: {plan.get('trigger', '?')}",
+                f"失效: {plan.get('invalidation', '?')}",
+                f"止损参考: {plan.get('stop_reference', '?')}",
+                f"目标参考: {plan.get('target_reference', '?')}",
+            ]
+        if ai.get("risk_warning"):
+            lines += ["", f"⚠️ 风险: {ai['risk_warning']}"]
+        if res.usage:
+            lines += ["", f"── Token 用量 ──", str(res.usage)]
+        return "\n".join(lines)
 
     # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────
     def _on_auto_toggle(self, checked: bool) -> None:

@@ -112,15 +112,20 @@ def compute_indicators(
     ema_period: int = 20,
     atr_period: int = 14,
 ) -> IndicatorBundle:
-    """计算 EMA/ATR/RSI/布林带/VWAP（周期可配置）。"""
+    """计算 EMA/ATR/RSI/布林带/VWAP（周期可配置）。
+
+    输入 bars 为新→旧（seq=1 为最新），指标计算内部按旧→新预热，
+    输出与输入同序（索引 0 = 最新 bar）。
+    """
     n = len(bars)
     if n == 0:
         return IndicatorBundle()
 
-    closes = [b.close for b in bars]
-    highs = [b.high for b in bars]
-    lows = [b.low for b in bars]
-    volumes = [b.volume for b in bars]
+    # 输入新→旧 → 反转成旧→新用于计算
+    closes = [b.close for b in reversed(bars)]
+    highs = [b.high for b in reversed(bars)]
+    lows = [b.low for b in reversed(bars)]
+    volumes = [b.volume for b in reversed(bars)]
 
     ema = ema_full(closes, ema_period)
     atr = atr_full(highs, lows, closes, atr_period)
@@ -128,14 +133,15 @@ def compute_indicators(
     bb_u, bb_m, bb_l = bollinger_full(closes, bollinger_period, bollinger_std)
     vwap = vwap_full(highs, lows, closes, volumes)
 
+    # 计算结果是旧→新，反转回新→旧以对齐 bars
     return IndicatorBundle(
-        ema20=tuple(ema),
-        atr14=tuple(atr),
-        rsi14=tuple(rsi),
-        bb_upper=tuple(bb_u),
-        bb_middle=tuple(bb_m),
-        bb_lower=tuple(bb_l),
-        vwap=tuple(vwap),
+        ema20=tuple(reversed(ema)),
+        atr14=tuple(reversed(atr)),
+        rsi14=tuple(reversed(rsi)),
+        bb_upper=tuple(reversed(bb_u)),
+        bb_middle=tuple(reversed(bb_m)),
+        bb_lower=tuple(reversed(bb_l)),
+        vwap=tuple(reversed(vwap)),
     )
 
 
