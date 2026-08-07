@@ -14,6 +14,8 @@ venv/
 # Config (contains API keys — never commit)
 config/settings.json
 *.example.json
+*.bak
+config/*.bak*
 
 # Outputs
 output/
