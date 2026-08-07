@@ -70,7 +70,14 @@ def fetch_mt5_bars(
     timeframe: str = "15m",
     n_bars: int = 100,
 ) -> list[KlineBar]:
-    """从 MT5 拉取 K 线，返回新→旧顺序的 KlineBar 列表。"""
+    """从 MT5 拉取 K 线，返回新→旧顺序的 KlineBar 列表。
+
+    注意：必须使用 copy_rates_from_pos 从「最新位置」取数。
+    原实现 copy_rates_from(now(), n_bars+20) 的 date_from 参数用本地时间，
+    与 GTC 服务器时区(约 GMT+11)错位 3 小时，导致返回的数据滞后约 3 小时
+    （最新K线停在本地时间对应的服务器时段，错过真实最新行情）。
+    copy_rates_from_pos 从最新 bar 开始往前取，无时区依赖，始终拿到实时数据。
+    """
     import MetaTrader5 as mt5
 
     if not mt5.initialize():
@@ -78,7 +85,7 @@ def fetch_mt5_bars(
 
     mt5_sym = resolve_mt5_symbol(symbol)
     tf = mt5_timeframe(timeframe)
-    rates = mt5.copy_rates_from(mt5_sym, tf, datetime.datetime.now(), n_bars + 20)
+    rates = mt5.copy_rates_from_pos(mt5_sym, tf, 0, n_bars + 20)
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"MT5 无数据: {mt5_sym} ({timeframe})")
 
