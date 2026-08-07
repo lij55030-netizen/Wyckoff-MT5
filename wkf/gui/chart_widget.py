@@ -101,16 +101,19 @@ class WkfChart(QWidget):
             self._items.append(line)
             self._plot.addItem(line)
 
-        # VA 阴影（用最新 POC/VAH/VAL 画水平区域）
+        # VA 阴影（用最新 POC/VAH/VAL 画水平价格区域）
+        # 注意：LinearRegionItem 默认 orientation='vertical'（x 方向区域），
+        # 若把价格 (val, vah) 直接传给它会被当作 x 坐标，污染 autoRange 视图范围
+        # （x 被撑到 29000 量级，蜡烛被压缩成几乎不可见）。
+        # 必须显式指定 orientation='horizontal'，让区域沿 y(价格) 方向。
         of = frame.orderflow
         if of is not None:
-            x_min = float(x.min())
-            x_max = float(x.max())
             vah = of.vah[0] if of.vah and not math.isnan(of.vah[0]) else None
             val = of.val[0] if of.val and not math.isnan(of.val[0]) else None
             if vah is not None and val is not None:
                 region = pg.LinearRegionItem(
                     values=(val, vah),
+                    orientation="horizontal",
                     brush=pg.mkBrush(120, 180, 255, 40),
                     pen=pg.mkPen(120, 180, 255, 120),
                     movable=False,
@@ -168,10 +171,16 @@ class WkfChart(QWidget):
         n = len(frame.bars)
         if n == 0:
             return
-        x = np.arange(n, dtype=float)  # 0=最旧 ... n-1=最新
+        # bars 为 新->旧（seq=1 最新在 index 0）；x 数组递减生成，
+        # 让最新一根 K 线显示在图表最右侧（时间从左往右）
+        x = np.arange(n, dtype=float)[::-1]  # n-1(最新) ... 0(最旧)
         self._render_candles(frame, x)
         self._render_indicator_lines(frame, x)
-        self._render_delta_bars(frame, x)
-        self._render_rsi(frame, x)
+        # 先 autoRange 确定真实视图范围，再画 Delta 条
+        # （Delta 条依赖 viewRange 取底部基准，若在 autoRange 前调用会拿到
+        #   默认范围 [-0.5,0.5]，导致 Delta 画到错误位置并二次污染范围）
         self._plot.autoRange()
+        self._render_delta_bars(frame, x)
+        self._plot.autoRange()
+        self._render_rsi(frame, x)
         self._rsi_plot.autoRange()
