@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import datetime
+import html
 import math
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenuBar,
     QPushButton,
@@ -24,6 +27,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -99,10 +103,92 @@ class _KlineTableWidget(QWidget):
         return "\n".join(lines)
 
 
+class _AiChatWidget(QWidget):
+    """问AI标签页：上层对话展示区 + 底部输入框/发送按钮（深色样式）。
+
+    仅负责 UI 展示与输入；提问逻辑由 MainWindow._on_ai_send 处理。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        # 上层：对话展示区（只读富文本）
+        self.view = QTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setStyleSheet(
+            "QTextEdit{background-color:#0f1419;color:#e6edf3;"
+            "border:1px solid #2a3442;border-radius:6px;font-size:13px;}"
+        )
+        layout.addWidget(self.view, stretch=1)
+
+        # 底部：输入框 + 发送按钮（适配深色样式）
+        input_row = QHBoxLayout()
+        input_row.setSpacing(6)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("输入问题，回车发送（基于当前分析结果提问）...")
+        self.input.setStyleSheet(
+            "QLineEdit{background-color:#1e2632;color:#e6edf3;"
+            "border:1px solid #2a3442;border-radius:6px;padding:7px 10px;font-size:13px;}"
+            "QLineEdit:focus{border-color:#3b82f6;}"
+        )
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setStyleSheet(
+            "QPushButton{background-color:#3b82f6;color:#fff;border:none;"
+            "border-radius:6px;padding:7px 18px;font-size:13px;font-weight:bold;}"
+            "QPushButton:hover{background-color:#2563eb;}"
+            "QPushButton:disabled{background-color:#334155;}"
+        )
+        input_row.addWidget(self.input, stretch=1)
+        input_row.addWidget(self.send_btn)
+        layout.addLayout(input_row)
+
+    def append_user(self, text: str) -> None:
+        self.view.append(
+            f"<p style='margin:4px 0'><b style='color:#3b82f6'>你：</b>"
+            f"<span style='color:#e6edf3'>{html.escape(text)}</span></p>"
+        )
+
+    def append_ai(self, body_html: str) -> None:
+        self.view.append(
+            f"<p style='margin:4px 0'><b style='color:#a78bfa'>AI：</b>{body_html}</p>"
+        )
+
+    def append_error(self, text: str) -> None:
+        self.view.append(
+            f"<p style='margin:4px 0'><b style='color:#ef4444'>⚠ {html.escape(text)}</b></p>"
+        )
+
+    def update_last_ai(self, body_html: str) -> None:
+        """把最后一条 AI 消息替换为正式回复（"思考中…"占位原地更新）。"""
+        from PyQt6.QtGui import QTextCursor
+
+        cursor = self.view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        cursor.removeSelectedText()
+        cursor.insertHtml(
+            f"<p style='margin:4px 0'><b style='color:#a78bfa'>AI：</b>{body_html}</p>"
+        )
+        self.view.setTextCursor(cursor)
+        self.view.ensureCursorVisible()
+
+    def show_analysis(self, plain_text: str) -> None:
+        """分析完成后：清空对话区并展示本次分析摘要（作为首条上下文）。"""
+        self.view.clear()
+        self.view.setPlainText(plain_text)
+
+    def toPlainText(self) -> str:
+        return self.view.toPlainText()
+
+
 class MainWindow(QMainWindow):
     # 工作线程 → UI 线程信号（PyQt6 线程安全回调）
     _fetch_done = pyqtSignal(object, object, str)  # frame, wyckoff, err
     _analysis_done = pyqtSignal(object)  # AnalysisResult
+    _ai_reply = pyqtSignal(str)  # 问AI对话回复（工作线程 → UI 线程）
 
     def __init__(self) -> None:
         super().__init__()
@@ -210,14 +296,17 @@ class MainWindow(QMainWindow):
         self._tab_diagnosis.setMaximumBlockCount(2000)
         tabs.addTab(self._tab_diagnosis, "🔍 诊断")
 
-        self._tab_decision = QPlainTextEdit()
+        self._tab_decision = QTextEdit()  # 决策页：富文本（红色粗体核心结论）
         self._tab_decision.setReadOnly(True)
-        self._tab_decision.setMaximumBlockCount(2000)
+        self._tab_decision.setStyleSheet(
+            "QTextEdit{background-color:#0f1419;color:#e6edf3;border:none;font-size:13px;}"
+        )
         tabs.addTab(self._tab_decision, "🎯 决策")
 
-        self._tab_ai = QPlainTextEdit()
-        self._tab_ai.setReadOnly(True)
-        self._tab_ai.setMaximumBlockCount(3000)
+        # 问AI页：对话容器（上层展示区 + 底部输入框/发送按钮，回车发送）
+        self._tab_ai = _AiChatWidget()
+        self._tab_ai.input.returnPressed.connect(self._on_ai_send)
+        self._tab_ai.send_btn.clicked.connect(self._on_ai_send)
         tabs.addTab(self._tab_ai, "🤖 问AI")
 
         result_split.addWidget(tabs)
@@ -236,14 +325,24 @@ class MainWindow(QMainWindow):
         self._analysis_busy = False
         self._history_count = 0
         self._has_ai_result = False
+        # 问AI对话状态
+        self._ai_busy = False
+        self._ai_reply.connect(self._on_ai_reply)
+        # 最近一次分析结果（供问AI追问上下文）
+        self._last_frame = None
+        self._last_wa = None
+        self._last_res = None
         # 请求令牌：记录最近一次 fetch/analyze 请求对应的品种+周期，
         # 响应返回时若用户已切换，则丢弃过期结果，防止旧品种数据覆盖新图表
         self._fetch_req = ("", "")
+        # K线收盘倒计时：1 秒定时器秒级实时刷新；MT5 时间戳每 5 秒校准一次（避免高频连接）
+        self._status_ts = 0
+        self._status_ts_fetched_at = 0.0
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_check_kline)
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_kline_status)
-        self._status_timer.start(5000)
+        self._status_timer.start(1000)  # 1 秒定时器：秒级实时倒计时
 
         # 启动后立即拉一次数据 + 状态
         self._on_fetch_data()
@@ -267,14 +366,15 @@ class MainWindow(QMainWindow):
         self._debounce_timer.start()
 
     def _append_history(self, symbol: str, timeframe: str, bias: str, report: str) -> None:
-        """把一次分析结果加入历史记录面板。"""
+        """把一次分析结果加入历史记录面板（方向文案汉化：long→多头等）。"""
         import datetime
 
+        bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(bias, bias)
         self._history_count += 1
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{self._history_count}] {ts} {symbol} {timeframe}"
-        if bias:
-            line += f" → {bias}"
+        if bias_zh:
+            line += f" → {bias_zh}"
         self._history_list.appendPlainText(line)
         self._history_list.verticalScrollBar().setValue(
             self._history_list.verticalScrollBar().maximum()
@@ -389,6 +489,10 @@ class MainWindow(QMainWindow):
         if res.frame is not None:
             self._chart.set_frame(res.frame)
             self._last_bar_ts = res.frame.bars[0].ts_open
+        # 保存最近分析结果（供问AI标签页追问上下文）
+        self._last_frame = res.frame
+        self._last_wa = res.wyckoff
+        self._last_res = res
         # 填充 5 个标签页
         self._populate_tabs(res.frame, res.wyckoff, res)
         # 历史记录
@@ -497,8 +601,8 @@ class MainWindow(QMainWindow):
         self._populate_data_table(frame)
         self._tab_snapshot.setPlainText(self._render_snapshot_tab(frame, wa))
         self._tab_diagnosis.setPlainText(self._render_diagnosis_tab(frame, wa))
-        self._tab_decision.setPlainText(self._render_decision_tab(wa))
-        self._tab_ai.setPlainText(self._render_ai_tab(res, wa))
+        self._tab_decision.setHtml(self._render_decision_tab(wa))  # 富文本（红色粗体结论）
+        self._tab_ai.show_analysis(self._render_ai_tab(res, wa))   # 分析摘要作为对话首条
 
     def _render_data_tab(self, frame) -> str:
         """数据标签页：分析了哪些数据（K线明细表，保留原实现供兼容）。"""
@@ -570,28 +674,58 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _render_decision_tab(self, wa) -> str:
-        """决策标签页：结果是什么（倾向/触发/失效/概率）。"""
+        """决策标签页（文案规范化重写）：行情倾向/入场触发/失效阈值/订单流结构/备注。
+
+        严格写实：全部内容仅基于 wa 中已计算出的盘面数据陈述，不做行情预判与夸大推演；
+        核心结论（行情倾向）使用红色粗体标注。
+        """
         if wa is None:
             return "未分析"
-        bias_zh = {"long": "偏多", "short": "偏空", "neutral": "中性观望"}.get(wa.bias, wa.bias)
-        lines = [
-            "=== 交易决策 ===",
-            "",
-            f"🎯 倾向:   {bias_zh}",
-            f"📈 入场触发: {wa.trigger}",
-            f"🚫 失效条件: {wa.invalidation}",
-        ]
+        bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}.get(wa.bias, wa.bias)
+        regime_zh = {
+            "trend_up": "上升趋势", "trend_down": "下降趋势",
+            "range": "区间震荡", "unknown": "结构不明",
+        }.get(wa.background.regime, wa.background.regime)
+        bg = wa.background
+
+        p = []
+        p.append("<div style='font-size:13px;line-height:1.8'>")
+        p.append("<p style='margin:2px 0 8px'><b style='color:#8b949e'>交易决策（基于当前盘面数据，严格写实）</b></p>")
+
+        # ① 行情倾向 —— 核心结论：红色粗体
+        p.append("<p style='margin:6px 0 2px'><b style='color:#e6edf3'>① 行情倾向</b></p>")
+        p.append(
+            f"<p style='margin:2px 0'><b><span style='color:#ef4444;font-size:15px'>{bias_zh}</span></b>"
+            f"　<span style='color:#8b949e'>背景：{regime_zh}（HH+HL {bg.hh_hl_count} 组 / LH+LL {bg.lh_ll_count} 组）</span></p>"
+        )
+
+        # ② 入场触发条件
+        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>② 入场触发条件</b></p>")
+        p.append(f"<p style='margin:2px 0;color:#e6edf3'>{html.escape(wa.trigger)}</p>")
+
+        # ③ 失效硬阈值
+        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>③ 失效硬阈值</b></p>")
+        p.append(f"<p style='margin:2px 0;color:#e6edf3'>{html.escape(wa.invalidation)}</p>")
+
+        # ④ 订单流结构
+        p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>④ 订单流结构</b></p>")
         if wa.orderflow is not None:
             of = wa.orderflow
-            lines += [
-                "",
-                "── 订单流支撑 ──",
-                f"活跃方: {of.active_side} | 反转阶段: {of.reversal_stage}",
-                f"失衡: {len(of.imbalances)} 处 | 堆叠: {len(of.stacked_imbalances)} 组",
-            ]
+            p.append(
+                f"<p style='margin:2px 0;color:#e6edf3'>活跃方：{of.active_side}　|　反转阶段：{of.reversal_stage}"
+                f"　|　失衡 {len(of.imbalances)} 处　|　堆叠 {len(of.stacked_imbalances)} 组</p>"
+            )
+        else:
+            p.append("<p style='margin:2px 0;color:#8b949e'>无订单流数据（Tick 数据不足）</p>")
+
+        # 备注
         if wa.notes:
-            lines += ["", "── 备注 ──", *[f"· {n}" for n in wa.notes]]
-        return "\n".join(lines)
+            p.append("<p style='margin:8px 0 2px'><b style='color:#e6edf3'>⑤ 备注</b></p>")
+            for n in wa.notes:
+                p.append(f"<p style='margin:2px 0;color:#8b949e'>· {html.escape(n)}</p>")
+
+        p.append("</div>")
+        return "".join(p)
 
     def _render_ai_tab(self, res, wa) -> str:
         """问AI标签页：AI 分析结论 + 概率 + 思考过程 + Token 统计。"""
@@ -658,6 +792,81 @@ class MainWindow(QMainWindow):
             ]
         return "\n".join(lines)
 
+    # ── 问AI：对话提问（基于当前分析结果）───────────────────────────────
+    def _build_ai_context(self) -> str:
+        """组装追问上下文：最近K线摘要 + 威科夫结论（均来自真实分析数据）。"""
+        parts = []
+        if self._last_frame is not None:
+            f = self._last_frame
+            b = f.bars[0]
+            parts.append(
+                f"品种 {f.symbol} {f.timeframe}，最新收盘 {b.close:.2f}（高 {b.high:.2f} / 低 {b.low:.2f}），"
+                f"成交量 {b.volume:.0f}，共 {len(f.bars)} 根K线。"
+            )
+            parts.append("最近5根K线（新→旧）：")
+            for i in range(min(5, len(f.bars))):
+                bar = f.bars[i]
+                ts = datetime.datetime.fromtimestamp(bar.ts_open / 1000).strftime("%m-%d %H:%M")
+                parts.append(f"  {ts} O={bar.open:.2f} H={bar.high:.2f} L={bar.low:.2f} C={bar.close:.2f} V={bar.volume:.0f}")
+        if self._last_wa is not None:
+            parts.append("")
+            parts.append("威科夫分析结论：")
+            parts.append(self._last_wa.render_text())
+        if not parts:
+            parts.append("（尚未运行分析，仅凭用户问题回答）")
+        return "\n".join(parts)
+
+    def _on_ai_send(self) -> None:
+        """用户发送提问：工作线程调用 DeepSeek，回复经信号回主线程展示。"""
+        q = self._tab_ai.input.text().strip()
+        if not q or self._ai_busy:
+            return
+        self._tab_ai.input.clear()
+        self._tab_ai.append_user(q)
+        self._tab_ai.append_ai("<span style='color:#8b949e'>思考中…</span>")
+        self._ai_busy = True
+        self._tab_ai.send_btn.setEnabled(False)
+
+        ctx = self._build_ai_context()
+
+        def _work() -> None:
+            try:
+                from wkf.ai.deepseek_client import DeepSeekClient
+
+                settings = self._settings
+                if not settings.provider.api_key:
+                    reply = "未配置 AI 模型 API Key（设置 → AI 模型设置），无法回答。"
+                else:
+                    client = DeepSeekClient(settings.provider)
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是 WKF 威科夫交易分析助手。基于给定的真实K线与威科夫分析结果回答用户问题；"
+                                "回答严谨、只陈述数据事实，不做行情预判与夸大推演；"
+                                "数据不足时如实说明；结尾固定附上「以上仅是王先生的分析，仅做参考，不可以作为价值投资。」"
+                            ),
+                        },
+                        {"role": "user", "content": f"{ctx}\n\n【用户问题】\n{q}"},
+                    ]
+                    reply = client.chat(messages, thinking=False)
+                    reply = reply.content or "（模型无输出）"
+                    if "价值投资" not in reply:
+                        reply += "\n\n以上仅是王先生的分析，仅做参考，不可以作为价值投资。"
+            except Exception as exc:  # noqa: BLE001
+                reply = f"❌ AI 调用失败：{exc}"
+            self._ai_reply.emit(reply)
+
+        threading.Thread(target=_work, name="wkf-ai-chat", daemon=True).start()
+
+    def _on_ai_reply(self, reply: str) -> None:
+        """AI 回复到达（主线程）：原地更新"思考中"占位为正式回复。"""
+        self._ai_busy = False
+        self._tab_ai.send_btn.setEnabled(True)
+        self._tab_ai.update_last_ai(
+            f"<span style='color:#e6edf3'>{html.escape(reply).replace(chr(10), '<br>')}</span>"
+        )
+
     # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────
     def _on_auto_toggle(self, checked: bool) -> None:
         self._auto_active = checked
@@ -693,22 +902,40 @@ class MainWindow(QMainWindow):
             self._update_kline_status()
 
     def _update_kline_status(self) -> None:
+        """K线收盘倒计时：1 秒定时器秒级实时刷新（修复原 5 秒刷新的滞后问题）。
+
+        实现：MT5 最新K线时间戳每 5 秒校准一次（避免每秒高频连接），
+        其余每秒用本地时间精确递减剩余收盘时间；
+        K线完结（时间戳变化）时自动以新K线起点重置倒计时。
+        """
         if self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
         timeframe = self._tf_combo.currentText()
-        ts = get_latest_bar_ts(symbol, timeframe)
+        now_mono = time.monotonic()
+
+        # 每 5 秒校准一次最新K线时间戳
+        if now_mono - self._status_ts_fetched_at >= 5.0:
+            ts = get_latest_bar_ts(symbol, timeframe)
+            if ts > 0:
+                if self._status_ts > 0 and ts != self._status_ts:
+                    # K线已完结 → 新K线起点自动重置倒计时
+                    self._status_ts = ts
+                    if not self._auto_active and self._last_bar_ts > 0:
+                        self._last_bar_ts = ts
+                self._status_ts = ts
+                self._status_ts_fetched_at = now_mono
+
+        ts = self._status_ts
         if ts <= 0:
             return
         minutes = TF_MINUTES.get(timeframe, 15)
         close_at = ts + minutes * 60 * 1000
-        now_ms = int(datetime.datetime.now().timestamp() * 1000)
-        remain_s = max(0, (close_at - now_ms) // 1000)
+        now_ms = int(time.time() * 1000)
+        remain_s = max(0, int((close_at - now_ms) // 1000))
         remain = f"{remain_s // 60}分{remain_s % 60}秒"
         if self._auto_active:
-            self._kline_status.setText(
-                f"♾ 持续跟踪中 · 当前K线 {remain} 后收盘"
-            )
+            self._kline_status.setText(f"♾ 持续跟踪中 · 当前K线 {remain} 后收盘")
         else:
             self._kline_status.setText(
                 f"K线: {datetime.datetime.fromtimestamp(ts / 1000).strftime('%H:%M')} 收盘 · 下一根 {remain} 后"
