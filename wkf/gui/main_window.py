@@ -76,13 +76,14 @@ class MainWindow(QMainWindow):
         self._fetch_btn.clicked.connect(self._on_fetch_data)
         ctrl.addWidget(self._fetch_btn)
 
-        self._analyze_btn = QPushButton("▶ 分析")
+        self._analyze_btn = QPushButton("📝 提交分析")
         self._analyze_btn.clicked.connect(self._on_analyze)
         ctrl.addWidget(self._analyze_btn)
 
-        self._auto_check = QCheckBox("⏱ 等待新K线收盘后自动分析")
+        self._auto_check = QCheckBox("♾ 持续跟踪分析")
         self._auto_check.setToolTip(
-            "开启后自动轮询 MT5，检测到新 K 线收盘即自动提交完整分析（含 AI）"
+            "开启后自动轮询 MT5，检测到新 K 线收盘即自动重新提交完整分析（含 AI），"
+            "持续跟踪最新行情；每次结果自动加入左侧历史记录"
         )
         self._auto_check.toggled.connect(self._on_auto_toggle)
         ctrl.addWidget(self._auto_check)
@@ -93,15 +94,32 @@ class MainWindow(QMainWindow):
         ctrl.addStretch(1)
         root.addLayout(ctrl)
 
-        # ── 图表 + 结果 ────────────────────────────────────────────────────
+        # ── 图表 + 分析结果面板（历史 + 详情）────────────────────────────
         split = QSplitter(Qt.Orientation.Vertical)
         self._chart = WkfChart()
         split.addWidget(self._chart)
 
+        # 结果区：左侧历史记录列表 + 右侧分析详情
+        result_split = QSplitter(Qt.Orientation.Horizontal)
+
+        history_panel = QWidget()
+        hist_layout = QVBoxLayout(history_panel)
+        hist_layout.setContentsMargins(0, 0, 0, 0)
+        hist_layout.addWidget(QLabel("📋 分析历史"))
+        self._history_list = QPlainTextEdit()
+        self._history_list.setReadOnly(True)
+        self._history_list.setMaximumBlockCount(500)
+        self._history_list.setFixedWidth(170)
+        hist_layout.addWidget(self._history_list)
+        result_split.addWidget(history_panel)
+
         self._result = QPlainTextEdit()
         self._result.setReadOnly(True)
         self._result.setMaximumBlockCount(2000)
-        split.addWidget(self._result)
+        result_split.addWidget(self._result)
+        result_split.setSizes([170, 630])
+
+        split.addWidget(result_split)
         split.setSizes([500, 220])
         root.addWidget(split, stretch=1)
 
@@ -109,6 +127,7 @@ class MainWindow(QMainWindow):
         self._auto_active = False
         self._last_bar_ts = 0
         self._analysis_busy = False
+        self._history_count = 0
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_check_kline)
         self._status_timer = QTimer(self)
@@ -117,6 +136,20 @@ class MainWindow(QMainWindow):
 
         # 启动后立即拉一次数据 + 状态
         self._on_fetch_data()
+
+    def _append_history(self, symbol: str, timeframe: str, bias: str, report: str) -> None:
+        """把一次分析结果加入历史记录面板。"""
+        import datetime
+
+        self._history_count += 1
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{self._history_count}] {ts} {symbol} {timeframe}"
+        if bias:
+            line += f" → {bias}"
+        self._history_list.appendPlainText(line)
+        self._history_list.verticalScrollBar().setValue(
+            self._history_list.verticalScrollBar().maximum()
+        )
 
     def _open_ai_dialog(self) -> None:
         dlg = AIModelDialog(self._settings, self)
@@ -196,6 +229,11 @@ class MainWindow(QMainWindow):
                 if res.frame is not None:
                     self._chart.set_frame(res.frame)
                     self._last_bar_ts = res.frame.bars[0].ts_open
+                # 分析结果加入历史面板
+                bias = ""
+                if res.wyckoff is not None:
+                    bias = res.wyckoff.bias
+                self._append_history(symbol, timeframe, bias, report)
                 self._analysis_busy = False
 
             QMetaObject.invokeMethod(self, _update, Qt.ConnectionType.QueuedConnection)
@@ -203,7 +241,7 @@ class MainWindow(QMainWindow):
         self._analysis_busy = True
         threading.Thread(target=_work, name="wkf-analysis", daemon=True).start()
 
-    # ── 自动分析：等待新 K 线收盘后自动提交 ───────────────────────────────
+    # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────
     def _on_auto_toggle(self, checked: bool) -> None:
         self._auto_active = checked
         if checked:
@@ -214,7 +252,7 @@ class MainWindow(QMainWindow):
             if ts > 0:
                 self._last_bar_ts = ts
             self._auto_timer.start(3000)  # 每 3 秒轮询
-            self._kline_status.setText("⏱ 自动分析已开启，等待新K线收盘...")
+            self._kline_status.setText("♾ 持续跟踪已开启，等待新K线收盘...")
         else:
             self._auto_timer.stop()
             self._kline_status.setText("K线: --")
@@ -231,7 +269,7 @@ class MainWindow(QMainWindow):
         if self._last_bar_ts > 0 and ts != self._last_bar_ts:
             # 新 K 线收盘！
             self._last_bar_ts = ts
-            self._kline_status.setText(f"🆕 新K线收盘 ({timeframe})，自动分析中...")
+            self._kline_status.setText(f"🆕 新K线收盘 ({timeframe})，持续跟踪分析中...")
             self._on_analyze()
         else:
             # 更新剩余时间显示
@@ -252,7 +290,7 @@ class MainWindow(QMainWindow):
         remain = f"{remain_s // 60}分{remain_s % 60}秒"
         if self._auto_active:
             self._kline_status.setText(
-                f"⏱ 自动分析中 · 当前K线 {remain} 后收盘"
+                f"♾ 持续跟踪中 · 当前K线 {remain} 后收盘"
             )
         else:
             self._kline_status.setText(
