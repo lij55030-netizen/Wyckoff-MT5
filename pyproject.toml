@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wkf"
+version = "0.1.0"
+description = "WKF — 威科夫2.0 交易分析智能体：背景判定→价值区域→订单流验证"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "WKF Team" }]
+dependencies = [
+    "PyQt6>=6.6",
+    "pyqtgraph>=0.13",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "openai>=1.40",
+    "pydantic>=2.7",
+    "requests>=2.31",
+    "MetaTrader5>=5.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+wkf = "wkf.main:main"
+
+[tool.setuptools.packages.find]
+include = ["wkf*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,16 @@
+; WKF 威科夫交易智能体 配置文件
+; 优先级：config.ini 覆盖 settings.json
+; 填写后重启程序生效
+
+[deepseek]
+; DeepSeek API Key（留空则自动切换纯规则模式，不调用 AI）
+api_key = sk-e4b2b816c30f4332a03a2d081b45c51b
+; 模型: deepseek-v4-pro / deepseek-v4-flash
+model = deepseek-v4-pro
+base_url = https://api.deepseek.com
+
+[feishu]
+; 飞书机器人 Webhook 地址（机器人只有webhook也能发通知）
+webhook_url = https://open.feishu.cn/open-apis/bot/v2/hook/fe784774-11b2-4078-a24e-641784ef2567
+; 飞书签名密钥（开启签名校验时填写，未开启留空）
+secret = p4kh16u6YChiHC7ahGd2Cf

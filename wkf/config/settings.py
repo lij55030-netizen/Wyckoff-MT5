@@ -1,0 +1,137 @@
+"""WKF 配置模型与路径。"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+CONFIG_DIR = PROJECT_ROOT / "config"
+SETTINGS_JSON_PATH = CONFIG_DIR / "settings.json"
+PROMPT_DIR = PROJECT_ROOT / "prompt_engineering"
+
+
+class ProviderSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = "deepseek-v4-pro"
+    base_url: str = "https://api.deepseek.com"
+    api_key: str = ""
+    thinking: bool = True
+    reasoning_effort: str = "high"
+    context_window: int = 2000000
+
+
+class GeneralSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    analysis_bar_count: int = 100
+    last_symbol: str = "NQ1!"
+    last_timeframe: str = "15m"
+
+
+class FeishuSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    webhook_url: str = ""
+    secret: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    provider: ProviderSettings = Field(default_factory=ProviderSettings)
+    general: GeneralSettings = Field(default_factory=GeneralSettings)
+    feishu: FeishuSettings = Field(default_factory=FeishuSettings)
+
+
+def load_settings(path: Path | None = None) -> Settings:
+    """加载 settings.json，并用 config.ini 覆盖（config.ini 优先级更高）。"""
+    p = path or SETTINGS_JSON_PATH
+    if not p.exists():
+        settings = Settings()
+    else:
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            settings = Settings.model_validate(raw)
+        except Exception:
+            settings = Settings()
+
+    # config.ini 覆盖（DeepSeek Key / Webhook / Secret / 模型）
+    ini = p.parent / "config.ini"
+    if ini.exists():
+        overrides = _parse_config_ini(ini)
+        if overrides.get("api_key"):
+            settings.provider.api_key = overrides["api_key"]
+        if overrides.get("model"):
+            settings.provider.model = overrides["model"]
+        if overrides.get("base_url"):
+            settings.provider.base_url = overrides["base_url"]
+        if overrides.get("webhook_url"):
+            settings.feishu.webhook_url = overrides["webhook_url"]
+        if overrides.get("secret"):
+            settings.feishu.secret = overrides["secret"]
+    return settings
+
+
+def _parse_config_ini(ini: Path) -> dict[str, str]:
+    """解析简单 INI（[section] key=value），返回扁平键值。"""
+    out: dict[str, str] = {}
+    try:
+        import configparser
+
+        cp = configparser.ConfigParser()
+        cp.read(ini, encoding="utf-8")
+        for section in cp.sections():
+            for k, v in cp.items(section):
+                out[f"{section}.{k}"] = v.strip()
+    except Exception:
+        pass
+    # 兼容扁平写法
+    flat: dict[str, str] = {}
+    try:
+        lines = ini.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return flat
+    cur_section = ""
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur_section = line[1:-1].strip().lower()
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            key = (cur_section + "." if cur_section else "") + k.strip().lower()
+            flat[key] = v.strip()
+    # 映射到配置键
+    mapping = {
+        "api_key": "provider.api_key", "deepseek_api_key": "provider.api_key",
+        "model": "provider.model", "deepseek_model": "provider.model",
+        "base_url": "provider.base_url",
+        "webhook": "feishu.webhook_url", "webhook_url": "feishu.webhook_url",
+        "feishu_webhook": "feishu.webhook_url",
+        "secret": "feishu.secret", "feishu_secret": "feishu.secret",
+    }
+    result: dict[str, str] = {}
+    for ini_key, target in mapping.items():
+        for k, v in flat.items():
+            if k.endswith(ini_key) or k == ini_key:
+                result[target.split(".")[-1]] = v
+                break
+    return result
+
+
+def save_settings(settings: Settings, path: Path | None = None) -> None:
+    p = path or SETTINGS_JSON_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        json.dumps(settings.model_dump(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
