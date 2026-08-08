@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenuBar,
+    QProgressBar,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -72,8 +73,10 @@ TF_MINUTES = {
     "1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
     "1h": 60, "2h": 120, "4h": 240, "1d": 1440, "1w": 10080,
 }
-# 图表默认时间级别：48 小时窗口（切换品种/周期后始终保持该窗口；日线/周线单独指定根数）
-WINDOW_HOURS = 48
+# 【改动点】V3.0：K线时长由 48 小时增加到 7 个工作日（7×24=168 小时）。
+# 切换品种/周期后始终保持该窗口；日线/周线单独指定根数；
+# 超短周期（1m/3m）因数据量过大设根数上限，避免加载卡顿。
+WINDOW_HOURS = 168
 # 【改动点】④K线内存缓存有效期（秒）：短周期重复切换命中缓存直接渲染，无需重请求
 CACHE_TTL_S = 60
 
@@ -120,6 +123,8 @@ class MainWindow(QMainWindow):
     _analysis_done = pyqtSignal(object)  # AnalysisResult
     _ai_reply = pyqtSignal(str)  # 问AI对话回复（工作线程 → UI 线程）
     _tick_updated = pyqtSignal(float)  # 最新成交价 tick 到达（工作线程 → UI 线程）
+    _analysis_progress = pyqtSignal(int, str)  # 分析进度（0~100, 阶段说明）
+    _ai_stream = pyqtSignal(str, str)  # AI 流式输出（reasoning, content）
 
     def __init__(self) -> None:
         super().__init__()
@@ -129,6 +134,8 @@ class MainWindow(QMainWindow):
         self._settings = load_settings()
         self._fetch_done.connect(self._on_fetch_done)
         self._analysis_done.connect(self._on_analysis_done)
+        self._analysis_progress.connect(self._on_analysis_progress)
+        self._ai_stream.connect(self._on_ai_stream)
 
         # ── 菜单栏 ─────────────────────────────────────────────────────────
         menubar = self.menuBar()
@@ -141,6 +148,16 @@ class MainWindow(QMainWindow):
         about_menu = menubar.addMenu("ℹ 关于")
         about_menu.addAction("关于 WKF", self._show_about)
 
+        # 【改动点】V3.0：菜单栏「关于」之后新增「运行时长」统计，
+        # 1 秒计时器实时刷新软件本次运行总时长（HH:MM:SS）。
+        self._uptime_action = menubar.addAction("⏱ 运行时长: 00:00:00")
+        self._uptime_action.setEnabled(False)  # 仅展示，不可点击
+        self._start_mono = time.monotonic()
+        self._uptime_timer = QTimer(self)
+        self._uptime_timer.timeout.connect(self._update_uptime)
+        self._uptime_timer.start(1000)
+        self._update_uptime()
+
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -152,21 +169,28 @@ class MainWindow(QMainWindow):
         self._fetch_btn = self._top._fetch_btn
         self._analyze_btn = self._top._analyze_btn
         self._auto_check = self._top._auto_check
+        self._close_confirm = self._top._close_confirm
         self._crosshair_btn = self._top._crosshair_btn
         self._ds_combo = self._top._ds_combo
         self._kline_status = self._top._kline_status
         self._clock_label = self._top._clock_label
+        self._alert_btn = self._top._alert_btn
 
         # 【改动点】需求三：数据源模式 → 品种列表。
-        # MT5 模式：NQ1!/ES1!/GC1!；yfinance 模式：BTC-USD/^GSPC/^NDX/^DJI。
-        # 切换数据源后重启生效（品种下拉内容随模式变化）。
+        # 【改动点】V3.0：MT5 模式改为动态拉取终端全部品种（207 个，可见排前）；
+        # yfinance 模式：BTC-USD/^GSPC/^NDX/^DJI。
         self._symbols = list(SYMBOLS)
         try:
-            if getattr(self._settings.general, "data_source", "mt5") == "yfinance":
+            mode = getattr(self._settings.general, "data_source", "mt5")
+            if mode == "yfinance":
                 from wkf.data.datasource import get_data_source
 
                 src = get_data_source("yfinance")
                 self._symbols = src.available_symbols() or self._symbols
+            else:
+                from wkf.data.mt5_source import get_mt5_symbols
+
+                self._symbols = get_mt5_symbols() or self._symbols
         except Exception:
             pass
         self._sym_combo.addItems(self._symbols)
@@ -178,12 +202,24 @@ class MainWindow(QMainWindow):
         # 周期下拉：显示中文文本(1分…日线/周线)，itemData 存内部键
         for label, key in TIMEFRAME_ITEMS:
             self._tf_combo.addItem(label, key)
+        # 【改动点】V3.0 收线确认：恢复上次保存的勾选状态。
+        self._close_confirm.setChecked(
+            getattr(self._settings.general, "close_confirm", True)
+        )
         # 默认配置恢复：读取 settings 中的 last_symbol/last_timeframe，
         # 默认品种 XAU/USD(GC1!)、默认周期 5 分钟。
-        init_sym = getattr(self._settings.general, "last_symbol", "GC1!") or "GC1!"
+        init_sym = getattr(self._settings.general, "last_symbol", "XAUUSD") or "XAUUSD"
+        try:
+            # 旧别名（GC1!/NQ1!/ES1!）映射到 MT5 真实品种，兼容历史记忆
+            from wkf.data.mt5_source import ALIAS_TO_MT5
+
+            init_sym = ALIAS_TO_MT5.get(init_sym, init_sym)
+        except Exception:
+            pass
+        if init_sym not in self._symbols:
+            init_sym = self._symbols[0]
         init_tf = getattr(self._settings.general, "last_timeframe", "5m") or "5m"
-        if init_sym in self._symbols:
-            self._sym_combo.setCurrentText(init_sym)
+        self._sym_combo.setCurrentText(init_sym)
         idx = self._tf_combo.findData(init_tf)
         self._tf_combo.setCurrentIndex(idx if idx >= 0 else 0)
         root.addWidget(self._top)
@@ -198,12 +234,25 @@ class MainWindow(QMainWindow):
         self._fetch_btn.clicked.connect(self._on_fetch_data)
         self._analyze_btn.clicked.connect(self._on_analyze)
         self._auto_check.toggled.connect(self._on_auto_toggle)
+        self._close_confirm.toggled.connect(self._on_close_confirm_toggled)
         self._crosshair_btn.toggled.connect(self._on_crosshair_toggle)
+        # 【改动点】V3.1：铃铛提示音开关（高亮=开 / 置灰=关，状态持久化）
+        self._alert_btn.setChecked(
+            getattr(self._settings.general, "alert_enabled", True)
+        )
+        self._alert_btn.toggled.connect(self._on_alert_toggled)
         self._ds_combo.currentIndexChanged.connect(self._on_data_source_changed)
 
         # ── 图表 + 分析结果面板（历史 + 标签页）────────────────────────────
+        # 【改动点】V3.1 拖拽卡顿优化：原生 QSplitter（双向拖拽可靠）
+        # + 纯色简约分割条（无阴影/渐变），降低渲染开销。
         split = QSplitter(Qt.Orientation.Vertical)
+        split.setStyleSheet("QSplitter::handle{background-color:#2a3442;}")
+        # 【改动点】V3.0 分割防卡死：禁止图表区完全折叠，保留最小可视高度，
+        # 分割拖拽把手持续可见，可随时反向拉回。
+        split.setChildrenCollapsible(False)
         self._chart = WkfChart()
+        self._chart.setMinimumHeight(120)  # K线图表最小可视高度
         split.addWidget(self._chart)
 
         # 【改动点】V1.3.3 图表交互：空格键重置图表为完整视图。
@@ -214,9 +263,22 @@ class MainWindow(QMainWindow):
 
         # 【改动点】V1.3.3：底部状态栏实时展示当前激活数据源名称。
         self.statusBar().showMessage(f"行情数据源：{self._data_source_label()}", 0)
+        # 【改动点】V3.0：图表指标显隐开关（其他设置 → 显示技术指标）。
+        self._chart.show_indicators = getattr(
+            self._settings.general, "show_indicators", True
+        )
+        # 【改动点】V3.0：自动恢复图表——用户拖拽/缩放看历史后，
+        # 停止操作 10 秒自动回到最新完整视图（也可点「⏫ 回到最新」或按空格）。
+        self._view_restore_timer = QTimer(self)
+        self._view_restore_timer.setSingleShot(True)
+        self._view_restore_timer.setInterval(10000)
+        self._view_restore_timer.timeout.connect(self._chart.reset_view)
+        self._chart.view_changed_manually.connect(self._view_restore_timer.start)
 
         # 结果区：左侧历史记录面板 + 右侧标签页（数据/快照/诊断/决策/问AI）
         result_split = QSplitter(Qt.Orientation.Horizontal)
+        # 【改动点】V3.0：左侧日志面板不可被完全拖隐藏（最小宽度保护）
+        result_split.setChildrenCollapsible(False)
 
         self._history_panel = HistoryPanel()
         self._history_list = self._history_panel._history_list
@@ -224,6 +286,7 @@ class MainWindow(QMainWindow):
 
         # 5 个标签页
         tabs = QTabWidget()
+        self._tabs = tabs  # 【改动点】V3.0：保存引用，分析完成后自动切换到结果页
         # 数据标签页：K线明细表格（UI 展示优化，自带 toPlainText 兼容）
         self._tab_data = KlineTableWidget()
         self._table_status = self._tab_data.status_label
@@ -273,7 +336,26 @@ class MainWindow(QMainWindow):
         )
         tabs.setCornerWidget(self._contact_label, Qt.Corner.TopRightCorner)
 
-        result_split.addWidget(tabs)
+        # 【改动点】V3.1：标签栏下方新增横向分析进度条
+        # （阶段：数据加载0~25 / 快照生成25~50 / AI诊断50~80 / 决策组装80~100，
+        #  分析完成自动归零）。
+        self._tab_container = QWidget()
+        tab_v = QVBoxLayout(self._tab_container)
+        tab_v.setContentsMargins(0, 0, 0, 0)
+        tab_v.setSpacing(2)
+        tab_v.addWidget(tabs, 1)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setFixedHeight(6)
+        self._progress.setTextVisible(False)
+        self._progress.setStyleSheet(
+            "QProgressBar{background-color:#161d26;border:none;"
+            "border-radius:3px;}"
+            "QProgressBar::chunk{background-color:#3288D4;border-radius:3px;}"
+        )
+        tab_v.addWidget(self._progress)
+        result_split.addWidget(self._tab_container)
         result_split.setSizes([170, 630])
 
         split.addWidget(result_split)
@@ -286,7 +368,14 @@ class MainWindow(QMainWindow):
         # ── 自动分析状态 ───────────────────────────────────────────────────
         self._auto_active = False
         self._last_bar_ts = 0
+        self._waiting_close_ts = 0  # 收线确认：正在等待收盘的 K 线 ts_open（0=无）
         self._analysis_busy = False
+        # 【改动点】V3.1：AI 流式输出缓冲（100ms 合并刷新到诊断页，避免高频 append 卡顿）
+        self._ai_stream_buf = ""
+        self._ai_stream_timer = QTimer(self)
+        self._ai_stream_timer.setInterval(100)
+        self._ai_stream_timer.timeout.connect(self._flush_ai_stream)
+        self._pending_alert_res = None  # 进度 100% 后触发提示音用
         # 【改动点】异步加载迭代：全局加载锁 + 请求序号 + 当前工作线程引用。
         #  - _loading=True 时忽略新的切换触发（不排队，仅记录 pending 最后意图）；
         #  - _fetch_seq 递增序号用于丢弃过期响应（与 _fetch_req 令牌双重校验）。
@@ -395,6 +484,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """关闭窗口：停止定时器与后台线程，避免进程残留。"""
+        self._uptime_timer.stop()
         self._tick_timer.stop()
         self._status_timer.stop()
         self._auto_timer.stop()
@@ -402,20 +492,34 @@ class MainWindow(QMainWindow):
             self._fetch_thread.wait(2000)
         super().closeEvent(event)
 
+    def _update_uptime(self) -> None:
+        """更新菜单栏「运行时长」显示（本次运行累计时长，1 秒刷新）。"""
+        elapsed = int(time.monotonic() - self._start_mono)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        self._uptime_action.setText(f"⏱ 运行时长: {h:02d}:{m:02d}:{s:02d}")
+
     # ── 48 小时时间级别：按周期换算需要拉取的K线根数 ─────────────────────
     def _window_bar_count(self, timeframe: str) -> int:
-        """返回 48 小时窗口对应的K线根数（含用户自定义根数下限）。
+        """返回 7 个工作日（168h）窗口对应的K线根数（含用户自定义根数下限）。
 
-        【改动点】日线/周线不再套用 48 小时换算（会退化为 2 根/0 根），
-        单独指定根数：日线 60 根、周线 30 根；其余周期保持 48 小时窗口。
-        【验证方式】选择日线图表约 60 根、周线约 30 根，5分=576 根（48h）。
+        【改动点】V3.0：窗口由 48h 扩至 7 个工作日（168h）。
+        日线/周线单独指定根数：日线 60 根、周线 30 根；
+        1m/3m 因 168h 数据量过大（1m=10080 根）设根数上限保证加载流畅：
+        1m≤2880 根（48h）、3m≤1680 根（84h）；其余周期按 168h 窗口换算。
+        【验证方式】5分≈2016 根（7 天）、15分=672 根、日线 60 根、周线 30 根。
         """
         if timeframe == "1d":
             return 60
         if timeframe == "1w":
             return 30
         minutes = TF_MINUTES.get(timeframe, 15)
-        base = WINDOW_HOURS * 60 // minutes  # 48h 对应根数
+        base = WINDOW_HOURS * 60 // minutes  # 168h 对应根数
+        # 超短周期上限（防 tick 订单流增强导致加载过慢）
+        if timeframe == "1m":
+            base = min(base, 2880)
+        elif timeframe == "3m":
+            base = min(base, 1680)
         # 若用户在「其他设置」调大了K线数量则尊重用户配置（显示更多）
         return max(base, getattr(self._settings.general, "analysis_bar_count", 48))
 
@@ -512,6 +616,13 @@ class MainWindow(QMainWindow):
 
                 src = get_data_source("yfinance")
                 new_symbols = src.available_symbols() or new_symbols
+            except Exception:
+                pass
+        else:
+            try:
+                from wkf.data.mt5_source import get_mt5_symbols
+
+                new_symbols = get_mt5_symbols() or new_symbols
             except Exception:
                 pass
         self._symbols = new_symbols
@@ -623,7 +734,6 @@ class MainWindow(QMainWindow):
         """
         # 1. 清空主图与 RSI 数据层（overlay 层独立保留）
         self._chart.clear_items()
-        self._chart.clear_rsi()
         # 2. 重置视图状态与旧数据帧（新数据强制 autoRange；十字线吸附基准一并失效）
         self._chart.reset_view_state(symbol)
         # 3. 隐藏实时价格线/十字光标 + 挂起鼠标监听（加载完成后恢复）
@@ -669,6 +779,13 @@ class MainWindow(QMainWindow):
         dlg = IndicatorDialog(self._settings, self)
         if dlg.exec() and self._ui_alive():
             self._settings = load_settings()
+            # 【改动点】V3.0：指标显隐开关保存后立即生效——
+            # 同步图表标志并用当前数据帧重绘（纯K线模式无需重新拉取）。
+            self._chart.show_indicators = getattr(
+                self._settings.general, "show_indicators", True
+            )
+            if self._chart._frame is not None:
+                self._chart.set_frame(self._chart._frame)
 
     def _ui_alive(self) -> bool:
         return self.isVisible() and self.isEnabled()
@@ -794,11 +911,19 @@ class MainWindow(QMainWindow):
         bar_count = self._window_bar_count(timeframe)
         self._set_table_status(f"⏳ 正在分析 {symbol} {timeframe}（{WINDOW_HOURS}h 窗口）...")
         self._data_table.setRowCount(0)
+        # 【改动点】V3.1：进度条启动（阶段1 数据加载 0~25）
+        self._progress.setValue(5)
+        # 【改动点】V3.1：AI 流式输出——清空缓冲，诊断页标记实时推理开始
+        self._ai_stream_buf = ""
+        self._ai_stream_timer.stop()
+        self._tab_diagnosis_panel.append_ai_stream("🤖 AI 推理中，实时输出思考过程...\n")
 
         def _work() -> None:
             res = run_analysis(
                 symbol, timeframe, bar_count=bar_count,
                 settings=self._settings, with_ai=True,
+                progress_callback=lambda pct, label: self._analysis_progress.emit(pct, label),
+                ai_stream_callback=lambda r, c: self._ai_stream.emit(r, c),
             )
             self._analysis_done.emit(res)
 
@@ -816,7 +941,14 @@ class MainWindow(QMainWindow):
         if res.error:
             self._set_table_status(f"❌ 分析失败: {res.error}")
             self._data_table.setRowCount(0)
+            # 进度条：失败也归零重置
+            self._progress.setValue(100)
+            QTimer.singleShot(600, lambda: self._progress.setValue(0))
             return
+        # 【改动点】V3.1：分析完成 → 决策组装阶段 80→100 平滑补齐，
+        # 全部结束后（100%）触发提示音并归零重置。
+        self._pending_alert_res = res
+        QTimer.singleShot(0, self._advance_progress_to_100)
         if res.frame is not None:
             self._chart.set_frame(res.frame)
             self._last_bar_ts = res.frame.bars[0].ts_open
@@ -828,6 +960,12 @@ class MainWindow(QMainWindow):
         self._analysis_time = beijing_now_str()
         # 填充 5 个标签页
         self._populate_tabs(res.frame, res.wyckoff, res)
+        # 【改动点】V3.0：分析完成后自动切换到「🎯 决策」结果页，
+        # 让用户提交分析后能直观看到分析结论（此前停留在原页无法感知结果）。
+        try:
+            self._tabs.setCurrentWidget(self._tab_decision_panel)
+        except Exception:
+            pass
         # 历史记录（使用同一分析时间戳）
         bias = res.wyckoff.bias if res.wyckoff is not None else ""
         self._append_history(res.symbol, res.timeframe, bias, res.to_report(), self._analysis_time)
@@ -852,16 +990,6 @@ class MainWindow(QMainWindow):
                 self._tab_backtest.refresh()
         except Exception:
             pass  # 存档失败不影响主流程
-        # 【改动点】高概率行情提示音：综合概率（多/空取大值）> 60% 播放单次提示音。
-        if res.wyckoff is not None:
-            try:
-                prob = compute_probabilities(res.wyckoff)
-                if max(prob.get("long", 0), prob.get("short", 0)) > 60:
-                    from wkf.util.audio_player import play_alert
-
-                    play_alert(res.symbol)
-            except Exception:
-                pass
         # 飞书推送：仅分析完成触发；防抖/高亮/日志均在 notifier 内处理
         self._spawn_feishu_push(res, bias)
 
@@ -936,6 +1064,13 @@ class MainWindow(QMainWindow):
         # 提交分析联动：在问AI面板自动追加一条完整分析日志（推理步骤 + Token 消耗）
         title = f"{frame.symbol} {frame.timeframe} 分析日志"
         self._tab_ai.append_log(title, self._render_ai_tab(res, wa))
+        # 【改动点】V3.1 内容分区：AI 完整思考/盘面拆解/逐步研判 → 诊断页；
+        # AI 精简最终结论/点位/风控/多空概率 → 决策页。两页隔离不覆盖。
+        if res is not None:
+            self._tab_diagnosis_panel.append_ai_reasoning(
+                res.ai_reasoning, res.ai_diagnosis
+            )
+            self._tab_decision_panel.append_ai_plan(res.ai_diagnosis)
 
     # ── 旧渲染方法（保留为兼容转发；子控件已承载渲染逻辑）────────────────
     def _render_data_tab(self, frame) -> str:
@@ -1123,8 +1258,68 @@ class MainWindow(QMainWindow):
             )
 
     # ── 自动分析：持续跟踪，等待新 K 线收盘后自动重新分析 ─────────────────
+    def _on_close_confirm_toggled(self, checked: bool) -> None:
+        """收线确认开关：持久化到设置（下次启动保留勾选状态）。"""
+        self._settings.general.close_confirm = checked
+        try:
+            from wkf.config.settings import save_settings, SETTINGS_JSON_PATH
+
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+        except Exception:
+            pass
+
+    def _on_alert_toggled(self, checked: bool) -> None:
+        """铃铛提示音开关：高亮=开 / 置灰=关，状态持久化。"""
+        self._settings.general.alert_enabled = checked
+        try:
+            from wkf.config.settings import save_settings, SETTINGS_JSON_PATH
+
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+        except Exception:
+            pass
+
+    def _on_analysis_progress(self, pct: int, label: str) -> None:
+        """分析进度（子线程 → 主线程）：更新标签栏下方进度条。"""
+        self._progress.setValue(max(0, min(100, pct)))
+        if label:
+            self._set_table_status(f"⏳ {label}（{pct}%）")
+
+    # 【改动点】V3.1：AI 流式输出——边运算边实时输出到诊断页
+    def _on_ai_stream(self, reasoning: str, content: str) -> None:
+        self._ai_stream_buf += (reasoning or "") + (content or "")
+        self._ai_stream_timer.start()  # 100ms 合并刷新
+
+    def _flush_ai_stream(self) -> None:
+        if self._ai_stream_buf:
+            self._tab_diagnosis_panel.append_ai_stream(self._ai_stream_buf)
+            self._ai_stream_buf = ""
+        self._ai_stream_timer.stop()
+
+    def _advance_progress_to_100(self) -> None:
+        """决策组装阶段：进度从当前值平滑补齐到 100%。
+
+        100% 全部结束后（决策内容生成完成）才触发提示音（铃铛开启时），
+        随后短暂停留并归零重置。
+        """
+        cur = self._progress.value()
+        if cur < 100:
+            self._progress.setValue(min(100, cur + 4))
+            QTimer.singleShot(60, self._advance_progress_to_100)
+            return
+        res = self._pending_alert_res
+        self._pending_alert_res = None
+        if res is not None and res.wyckoff is not None and self._alert_btn.isChecked():
+            try:
+                from wkf.util.audio_player import play_alert
+
+                play_alert(res.symbol)
+            except Exception:
+                pass
+        QTimer.singleShot(800, lambda: self._progress.setValue(0))
+
     def _on_auto_toggle(self, checked: bool) -> None:
         self._auto_active = checked
+        self._waiting_close_ts = 0
         if checked:
             symbol = self._sym_combo.currentText()
             timeframe = self._current_tf()
@@ -1132,13 +1327,14 @@ class MainWindow(QMainWindow):
             if ts > 0:
                 self._last_bar_ts = ts
             self._auto_timer.start(3000)  # 每 3 秒轮询
-            self._kline_status.setText("♾ 持续跟踪已开启，等待新K线收盘...")
+            mode = "收线确认" if self._close_confirm.isChecked() else "立即分析"
+            self._kline_status.setText(f"♾ 持续跟踪已开启（{mode}），等待新K线收盘...")
         else:
             self._auto_timer.stop()
             self._kline_status.setText("K线: --")
 
     def _auto_check_kline(self) -> None:
-        """轮询 MT5：检测到新 K 线收盘 → 自动提交分析。"""
+        """轮询 MT5：检测到新 K 线后，按「收线确认」规则自动提交分析。"""
         if self._analysis_busy:
             return
         symbol = self._sym_combo.currentText()
@@ -1146,13 +1342,41 @@ class MainWindow(QMainWindow):
         ts = get_latest_bar_ts(symbol, timeframe)
         if ts <= 0:
             return
+        minutes = TF_MINUTES.get(timeframe, 15)
+        period_ms = minutes * 60 * 1000
+
         if self._last_bar_ts > 0 and ts != self._last_bar_ts:
-            # 新 K 线收盘！
+            # 检测到新 K 线开始
             self._last_bar_ts = ts
-            self._kline_status.setText(f"🆕 新K线收盘 ({timeframe})，持续跟踪分析中...")
-            self._on_analyze()
+            if self._close_confirm.isChecked():
+                # 收线确认：等这根 K 线走完（收盘定型）再分析
+                self._waiting_close_ts = ts
+                self._kline_status.setText(
+                    f"⏳ 新K线开始 ({timeframe})，收线确认后分析..."
+                )
+            else:
+                self._kline_status.setText(
+                    f"🆕 新K线开始 ({timeframe})，立即分析..."
+                )
+                self._on_analyze()
+
+        if self._waiting_close_ts:
+            # 收线确认等待中：当前等待的 K 线已收盘 → 开始分析
+            server_now_ms = int(time.time() * 1000) + self._server_offset_ms
+            if server_now_ms >= self._waiting_close_ts + period_ms:
+                self._waiting_close_ts = 0
+                self._kline_status.setText(
+                    f"🆕 K线已收线 ({timeframe})，开始分析..."
+                )
+                self._on_analyze()
+            else:
+                remain_s = max(
+                    0, int((self._waiting_close_ts + period_ms - server_now_ms) // 1000)
+                )
+                self._kline_status.setText(
+                    f"⏳ 等待K线收线确认 · 剩余 {remain_s // 60}分{remain_s % 60}秒"
+                )
         else:
-            # 更新剩余时间显示
             self._update_kline_status()
 
     def _measure_server_offset(self) -> int:

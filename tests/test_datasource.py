@@ -58,7 +58,12 @@ class TestMT5Source(unittest.TestCase):
         self.assertGreater(src.get_tick_size("BTC-USD"), 0)
 
     def test_available_symbols(self) -> None:
-        self.assertEqual(MT5Source().available_symbols(), ["NQ1!", "ES1!", "GC1!"])
+        """MT5 品种列表为动态获取（≥3 且包含可见核心品种）。"""
+        syms = MT5Source().available_symbols()
+        self.assertGreaterEqual(len(syms), 3)
+        self.assertIn("XAUUSD", syms)
+        self.assertIn("US500c", syms)
+        self.assertIn("USTECHc", syms)
 
 
 class TestYfinanceSource(unittest.TestCase):

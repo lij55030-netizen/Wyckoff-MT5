@@ -11,7 +11,9 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QHBoxLayout,
     QLineEdit,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
 )
@@ -56,26 +58,58 @@ class AIModelDialog(_BaseDialog):
         self._settings = settings
         p = settings.provider
 
-        self._model = QLineEdit(p.model)
         self._base_url = QLineEdit(p.base_url)
+        # 【改动点】V3.0：API Key 默认隐藏（密码圆点），可点击按钮切换显示/隐藏。
         self._api_key = QLineEdit(p.api_key)
         self._api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_btn = QPushButton("👁 显示")
+        self._key_btn.setCheckable(True)
+        self._key_btn.setFixedWidth(72)
+        self._key_btn.setToolTip("点击切换 API Key 的显示/隐藏（默认隐藏保护密钥）")
+        self._key_btn.toggled.connect(self._on_key_visibility)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self._api_key, 1)
+        key_row.addWidget(self._key_btn)
         self._context = QSpinBox()
         self._context.setRange(4000, 2000000)
         self._context.setSingleStep(10000)
         self._context.setValue(p.context_window)
         self._thinking = QCheckBox("启用深度思考（DeepSeek 专用）")
         self._thinking.setChecked(p.thinking)
+        # 【改动点】V3.0：用户自定义选择 AI 模型（可编辑下拉：预设常见模型 + 任意输入）。
+        self._model_combo = QComboBox()
+        self._model_combo.setEditable(True)
+        self._model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        preset_models = [
+            "deepseek-v4-pro",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ]
+        if p.model and p.model not in preset_models:
+            preset_models.insert(0, p.model)
+        self._model_combo.addItems(preset_models)
+        self._model_combo.setCurrentText(p.model)
+        self._model_combo.setToolTip("下拉选择常用模型，也可直接输入自定义模型名（任意 OpenAI 兼容模型）")
 
-        self._form.addRow("模型名称:", self._model)
         self._form.addRow("API 地址:", self._base_url)
-        self._form.addRow("API Key:", self._api_key)
+        self._form.addRow("API Key:", key_row)
         self._form.addRow("上下文窗口:", self._context)
         self._form.addRow("", self._thinking)
+        # 用户自定义选择 AI 模型：置于「启动深度思考」下方
+        self._form.addRow("AI 模型:", self._model_combo)
+
+    def _on_key_visibility(self, show: bool) -> None:
+        """切换 API Key 显示/隐藏（默认隐藏，想看可点开）。"""
+        self._api_key.setEchoMode(
+            QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password
+        )
+        self._key_btn.setText("🙈 隐藏" if show else "👁 显示")
 
     def _on_save(self) -> None:
         p = self._settings.provider
-        p.model = self._model.text().strip() or "deepseek-v4-pro"
+        p.model = self._model_combo.currentText().strip() or "deepseek-v4-pro"
         p.base_url = self._base_url.text().strip() or "https://api.deepseek.com"
         p.api_key = self._api_key.text().strip()
         p.context_window = self._context.value()
@@ -190,6 +224,15 @@ class IndicatorDialog(_BaseDialog):
         idx = self._table_style.findData(g.table_style)
         self._table_style.setCurrentIndex(idx if idx >= 0 else 0)
 
+        # 【改动点】V3.0：显示技术指标开关——取消勾选即纯K线模式
+        # （隐藏 EMA/布林带/VWAP/VA/POC/Delta/RSI，仅保留 K 线蜡烛）。
+        self._show_indicators = QCheckBox("显示技术指标（取消勾选 = 纯K线）")
+        self._show_indicators.setChecked(getattr(g, "show_indicators", True))
+        self._show_indicators.setToolTip(
+            "勾选：K线图叠加 EMA20/布林带/VWAP/价值区域/Delta/RSI。\n"
+            "取消：只显示 K 线蜡烛（实时价格线与十字光标仍可用）。"
+        )
+
         # 【改动点】数据源切换开关（需求三）：MT5（完整功能）/ yfinance（可选，无Tick）
         # 【涉及文件】wkf/gui/settings_dialogs.py + wkf/config/settings.py + wkf/data/datasource.py
         # 【验证方式】切换到 yfinance 保存后，GUI 弹窗提示无Tick并隐藏订单流；MT5 恢复完整功能
@@ -213,6 +256,7 @@ class IndicatorDialog(_BaseDialog):
         self._form.addRow("足迹失衡倍数:", self._fp_threshold)
         self._form.addRow("摆动检测窗口:", self._swing_window)
         self._form.addRow("K线明细表格样式:", self._table_style)
+        self._form.addRow("", self._show_indicators)
         self._form.addRow("行情数据源:", self._data_source)
 
     def _on_save(self) -> None:
@@ -221,6 +265,7 @@ class IndicatorDialog(_BaseDialog):
         g.analysis_bar_count = self._bar_count.value()
         g.table_style = self._table_style.currentData() or "new"
         g.data_source = self._data_source.currentData() or "mt5"
+        g.show_indicators = self._show_indicators.isChecked()
         ind.rsi_period = self._rsi_period.value()
         ind.bollinger_period = self._bb_period.value()
         ind.bollinger_std = self._bb_std.value()

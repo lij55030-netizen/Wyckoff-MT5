@@ -6,7 +6,8 @@ import math
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QSplitter, QVBoxLayout, QWidget
 
 from wkf.data.base import KlineFrame
 
@@ -22,7 +23,6 @@ CROSSHAIR_CFG = {
     "label_bg": (13, 17, 23, 210),   # 标签背景（半透明深色）
     "label_fg": "#e6edf3",           # 标签前景文字色
     "label_border": "#3b82f6",       # 标签描边色
-    "rsi_sync": True,                # RSI 副图是否同步垂直光标线
 }
 
 LAST_PRICE_CFG = {
@@ -57,14 +57,28 @@ def _pen_from(color, width, style="dash"):
 class WkfChart(QWidget):
     """威科夫风格 K 线图。"""
 
+    # 【改动点】V3.0：用户手动缩放/平移视图时通知主窗口（用于自动恢复图表）。
+    view_changed_manually = pg.QtCore.pyqtSignal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # 【改动点】V3.0：分割器保留（单面板），K线主图自动填满上下空间。
+        self._split = QSplitter(Qt.Orientation.Vertical)
+        # 【改动点】V3.0 修复分割布局 BUG：
+        #  1. 禁止子面板完全折叠（否则拖拽后手柄消失无法拉回）；
+        #  2. 主图/副图均设最小高度，面板只能收缩到最小、不能彻底隐藏；
+        #  3. 保留自由拖拽调整大小。
+        self._split.setChildrenCollapsible(False)
+
         self._plot = pg.PlotWidget()
+        self._plot.setMinimumHeight(120)  # K线主图最小高度（不能完全折叠）
         self._plot.showGrid(x=True, y=True, alpha=0.15)
-        self._plot.setBackground("#0d1117")
+        # 【改动点】V3.0：主图表画布背景改为纯色 #082C32（深墨青绿），
+        # 去除原黑色底，绘图区域整体平铺该纯色；其余界面样式不动。
+        self._plot.setBackground("#082C32")
         # 【改动点】需求3：显式开启鼠标交互——左键拖拽平移 + 滚轮放大缩小，
         # 解除坐标轴锁定限制（pyqtgraph 默认开启，此处显式声明以防配置覆盖）。
         # 【涉及文件】wkf/gui/chart_widget.py（对应假设文件 kline_chart.py）
@@ -73,16 +87,8 @@ class WkfChart(QWidget):
         # 矩形框选放大：ViewBox 原生支持——右键拖拽拉出选区即局部放大
         # （左键=平移，滚轮=缩放，右键=框选放大，三键互不冲突）。
         self._plot.getPlotItem().vb.setMouseMode(pg.ViewBox.PanMode)
-        layout.addWidget(self._plot)
-
-        # RSI 子图（同样开启交互）
-        self._rsi_plot = pg.PlotWidget()
-        self._rsi_plot.setBackground("#0d1117")
-        self._rsi_plot.setFixedHeight(90)
-        self._rsi_plot.showGrid(x=True, y=True, alpha=0.15)
-        self._rsi_plot.setYRange(0, 100)
-        self._rsi_plot.setMouseEnabled(x=True, y=True)
-        layout.addWidget(self._rsi_plot)
+        self._split.addWidget(self._plot)
+        layout.addWidget(self._split)
 
         # 【改动点】需求3：用户手动缩放/平移标记——sigRangeChangedManually 仅由用户操作触发；
         # set_frame 刷新时若用户已手动调整视图，则不再强制 autoRange 重置，保留视图位置。
@@ -90,10 +96,13 @@ class WkfChart(QWidget):
         self._last_symbol: str | None = None
         self._last_key: tuple | None = None  # (symbol, timeframe)：任一变化重置视图
         self._plot.getPlotItem().vb.sigRangeChangedManually.connect(
-            lambda *_: setattr(self, "_user_viewed", True)
+            self._on_view_changed_manually
         )
 
         self._items: list = []
+        # 【改动点】V3.0：显示技术指标开关（False = 纯K线模式，
+        # 隐藏 EMA/BB/VWAP/VA/POC/Delta/RSI，仅保留 K 线蜡烛与交互覆盖层）。
+        self.show_indicators = True
 
         # ── 覆盖层（十字线 + 实时价格线）：与 _items 独立管理，set_frame 不清除 ──
         self._overlay_items: list = []
@@ -118,20 +127,12 @@ class WkfChart(QWidget):
             color=CROSSHAIR_CFG["label_fg"], fill=pg.mkBrush(*CROSSHAIR_CFG["label_bg"]),
             border=CROSSHAIR_CFG["label_border"], anchor=(0, 1),
         )
-        self._ch_rsi_vline = pg.InfiniteLine(
-            angle=90, movable=False, pen=_pen_from(
-                CROSSHAIR_CFG["line_color"], 1, CROSSHAIR_CFG["line_style"]),
-        )
         for it in (self._ch_vline, self._ch_hline, self._ch_label):
             it.setZValue(_Z_CROSS_LINE)
             it.setVisible(False)
             self._plot.addItem(it)
             self._overlay_items.append(it)
         self._ch_label.setZValue(_Z_CROSS_LABEL)
-        if CROSSHAIR_CFG["rsi_sync"]:
-            self._ch_rsi_vline.setVisible(False)
-            self._rsi_plot.addItem(self._ch_rsi_vline)
-            self._overlay_items.append(self._ch_rsi_vline)
 
         # 实时价格线：红色水平线 + 右上角价格标签（含货币单位）
         self._last_price_line = pg.InfiniteLine(
@@ -152,9 +153,11 @@ class WkfChart(QWidget):
         self._plot.addItem(self._last_price_label)
         self._overlay_items += [self._last_price_line, self._last_price_label]
 
-        # 鼠标跟踪：启用后 sigSceneMouseMoved 才能收到移动事件
+        # 【改动点】V3.0 十字光标修复：鼠标追踪需在「控件 + viewport」双层开启，
+        # 否则 pyqtgraph 的 sigMouseMoved 收不到移动事件，十字光标/价格标签无法显示。
         self.setMouseTracking(True)
         self._plot.setMouseTracking(True)
+        self._plot.viewport().setMouseTracking(True)
         self._plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
 
     def clear_items(self) -> None:
@@ -166,15 +169,6 @@ class WkfChart(QWidget):
                 pass
         self._items = []
 
-    def clear_rsi(self) -> None:
-        """清空 RSI 副图数据层，保留十字线 RSI 同步线（overlay）。"""
-        for it in list(self._rsi_plot.items()):
-            if it is not self._ch_rsi_vline:
-                try:
-                    self._rsi_plot.removeItem(it)
-                except Exception:
-                    pass
-
     def reset_view_state(self, symbol: str) -> None:
         """切换品种/周期前置：重置用户视图标记与旧数据帧，新数据强制 autoRange 适配。"""
         self._last_symbol = symbol
@@ -183,10 +177,14 @@ class WkfChart(QWidget):
         self._frame = None  # 旧数据帧失效（十字线吸附/实时价格线基准一并重置）
 
     def reset_view(self) -> None:
-        """空格键快捷键：重置图表为完整视图（主图 + RSI 全部 autoRange）。"""
+        """空格键快捷键：重置图表为完整视图（主图 autoRange）。"""
         self._user_viewed = False
         self._plot.autoRange()
-        self._rsi_plot.autoRange()
+
+    def _on_view_changed_manually(self, *_) -> None:
+        """用户手动缩放/平移（拖拽看历史）→ 标记 + 通知主窗口启动自动恢复计时。"""
+        self._user_viewed = True
+        self.view_changed_manually.emit()
 
     # ── 加载挂起/恢复（品种/周期切换期间禁用交互，避免旧数据残留）──────
     def suspend_interactions(self) -> None:
@@ -199,7 +197,6 @@ class WkfChart(QWidget):
         self._ch_vline.setVisible(False)
         self._ch_hline.setVisible(False)
         self._ch_label.setVisible(False)
-        self._ch_rsi_vline.setVisible(False)
         self._cross_idx = -1
 
     def resume_interactions(self) -> None:
@@ -325,19 +322,8 @@ class WkfChart(QWidget):
             self._items.append(it)
             self._plot.addItem(it)
 
-    def _render_rsi(self, frame: KlineFrame, x: np.ndarray) -> None:
-        ind = frame.indicators
-        if not ind.rsi14:
-            return
-        ys = np.array([v if not math.isnan(v) else np.nan for v in ind.rsi14[: len(x)]])
-        self._rsi_plot.plot(x, ys, pen=pg.mkPen(180, 120, 255, width=1))
-        self._rsi_plot.addLine(y=70, pen=pg.mkPen(240, 78, 74, style=pg.QtCore.Qt.PenStyle.DashLine))
-        self._rsi_plot.addLine(y=30, pen=pg.mkPen(62, 194, 82, style=pg.QtCore.Qt.PenStyle.DashLine))
-        self._rsi_plot.addLine(y=50, pen=pg.mkPen(150, 150, 150, style=pg.QtCore.Qt.PenStyle.DotLine))
-
     def set_frame(self, frame: KlineFrame) -> None:
         self.clear_items()
-        self.clear_rsi()
         n = len(frame.bars)
         if n == 0:
             return
@@ -356,15 +342,14 @@ class WkfChart(QWidget):
         # 让最新一根 K 线显示在图表最右侧（时间从左往右）
         x = np.arange(n, dtype=float)[::-1]  # n-1(最新) ... 0(最旧)
         self._render_candles(frame, x)
-        self._render_indicator_lines(frame, x)
+        if self.show_indicators:
+            self._render_indicator_lines(frame, x)
         # 仅在首次加载/切换品种时 autoRange 确定视图；用户手动缩放后保留视图。
         # （Delta 条依赖 viewRange 取底部基准，须在 autoRange 后调用）
         if do_autorange:
             self._plot.autoRange()
-        self._render_delta_bars(frame, x)
-        self._render_rsi(frame, x)
-        if do_autorange:
-            self._rsi_plot.autoRange()
+        if self.show_indicators:
+            self._render_delta_bars(frame, x)
 
         # 保存当前数据帧（供十字线吸附读取 OHLC/时间戳）
         self._frame = frame
@@ -386,7 +371,6 @@ class WkfChart(QWidget):
             self._ch_vline.setVisible(False)
             self._ch_hline.setVisible(False)
             self._ch_label.setVisible(False)
-            self._ch_rsi_vline.setVisible(False)
             self._cross_idx = -1
             self._in_chart_area = False
         elif self._frame is not None and self._mouse_scene_pos is not None:
@@ -419,7 +403,6 @@ class WkfChart(QWidget):
                 self._ch_vline.setVisible(False)
                 self._ch_hline.setVisible(False)
                 self._ch_label.setVisible(False)
-                self._ch_rsi_vline.setVisible(False)
 
     def _bar_index_at(self, vx: float) -> int:
         """视图 x 坐标 → 最近K线索引。
@@ -454,9 +437,6 @@ class WkfChart(QWidget):
         self._ch_hline.setPos(mouse_y)
         self._ch_vline.setVisible(True)
         self._ch_hline.setVisible(True)
-        if CROSSHAIR_CFG["rsi_sync"]:
-            self._ch_rsi_vline.setPos(x_center)
-            self._ch_rsi_vline.setVisible(True)
 
         # 数值标签：跟随交点位置（x=K线中心, y=鼠标价格），默认右上方；靠近右边界时翻转
         if CROSSHAIR_CFG["label_visible"]:
@@ -464,15 +444,20 @@ class WkfChart(QWidget):
             flip = x_center > (xr[0] + xr[1]) / 2
             self._ch_label.setPos(x_center, mouse_y)
             self._ch_label.setAnchor((1, 0) if flip else (0, 1))
-            self._ch_label.setText(self._format_crosshair_label(bar))
+            # 【改动点】V3.0：标签显示光标所在位置的（历史）价格 + 该K线 OHLC。
+            self._ch_label.setText(self._format_crosshair_label(bar, mouse_y))
             self._ch_label.setVisible(True)
 
-    def _format_crosshair_label(self, bar) -> str:
-        """十字线标签文本：时间戳 + 开/高/低/收。"""
+    def _format_crosshair_label(self, bar, mouse_y: float | None = None) -> str:
+        """十字线标签文本：光标位置价格（实时跟随鼠标）+ 时间戳 + 开/高/低/收。"""
         ts = datetime.datetime.fromtimestamp(bar.ts_open / 1000).strftime("%m-%d %H:%M")
-        return (f"{ts}\n"
-                f"开 {bar.open:.2f}  高 {bar.high:.2f}\n"
-                f"低 {bar.low:.2f}  收 {bar.close:.2f}")
+        lines = []
+        if mouse_y is not None:
+            lines.append(f"价格 {mouse_y:.2f}")
+        lines.append(ts)
+        lines.append(f"开 {bar.open:.2f}  高 {bar.high:.2f}")
+        lines.append(f"低 {bar.low:.2f}  收 {bar.close:.2f}")
+        return "\n".join(lines)
 
     # ────────────────────────────────────────────────────────────────────────
     # 实时价格标注（红色水平线 + 价格标签，随行情平滑更新）

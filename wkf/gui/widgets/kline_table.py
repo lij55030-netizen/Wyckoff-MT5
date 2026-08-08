@@ -70,6 +70,12 @@ class KlineTableWidget(QWidget):
         self._text_view = QPlainTextEdit()
         self._text_view.setReadOnly(True)
         self._text_view.setMaximumBlockCount(2000)
+        # 【改动点】V3.0 修复：背景 #0f1b19（与上方K线图表一致）+ 浅灰白文字
+        self._text_view.setStyleSheet(
+            "QPlainTextEdit{background-color:#0f1b19;color:#d0d5db;"
+            "border:1px solid #2a3442;font-size:13px;"
+            "font-family:'Microsoft YaHei UI',Consolas,monospace;}"
+        )
         self._text_view.hide()
         layout.addWidget(self._text_view)
 

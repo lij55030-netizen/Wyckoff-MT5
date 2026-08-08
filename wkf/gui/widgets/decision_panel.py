@@ -200,5 +200,36 @@ class DecisionPanel(QWidget):
         p.append("</div>")
         return "".join(p)
 
+    # 【改动点】V3.1 内容分区：AI 诊断执行完毕后，将精简最终交易结论、
+    # 点位、风控、多空概率统一渲染到【决策】标签页（追加在基础结论下方，不覆盖）。
+    def append_ai_plan(self, ai: dict | None) -> None:
+        if not ai:
+            return
+        plan = ai.get("trade_plan") or {}
+        lines = [
+            "<br><div style='border-top:1px solid #2a3442;padding-top:8px;"
+            "font-size:13px;line-height:1.8;'>",
+            "<b style='color:#3b82f6;'>🤖 AI 最终交易结论</b>",
+        ]
+        bias_zh = {"long": "多头", "short": "空头", "neutral": "中性"}
+        b = plan.get("bias", ai.get("direction", ""))
+        color = "#3ec252" if b == "long" else ("#f04e4a" if b == "short" else "#8b949e")
+        lines.append(
+            f"· 多空结论: <b style='color:{color};'>"
+            f"{bias_zh.get(str(b), html.escape(str(b)))}</b>"
+        )
+        if plan.get("trigger"):
+            lines.append(f"· 入场触发: {html.escape(str(plan['trigger']))}")
+        if plan.get("invalidation"):
+            lines.append(f"· 失效风控: {html.escape(str(plan['invalidation']))}")
+        if plan.get("stop_reference"):
+            lines.append(f"· 止损参考: {html.escape(str(plan['stop_reference']))}")
+        if plan.get("target_reference"):
+            lines.append(f"· 目标参考: {html.escape(str(plan['target_reference']))}")
+        if ai.get("risk_warning"):
+            lines.append(f"· ⚠️ 风险提示: {html.escape(str(ai['risk_warning']))}")
+        lines.append("</div>")
+        self.view.append("".join(lines))
+
     def toPlainText(self) -> str:
         return self.view.toPlainText()

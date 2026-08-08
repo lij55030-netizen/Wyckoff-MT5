@@ -148,9 +148,9 @@ class TestAsyncLoadSwitch(unittest.TestCase):
         win = self.win
         win._prepare_switch("GC1!", "5m", is_symbol_change=True)
         win._loading = True
-        win._sym_combo.setCurrentText("NQ1!")  # 触发 _on_selector_changed
+        win._sym_combo.setCurrentText("XAUUSD")  # 触发 _on_selector_changed
         QApplication.processEvents()
-        self.assertEqual(win._pending_switch, ("NQ1!", win._current_tf()))
+        self.assertEqual(win._pending_switch, ("XAUUSD", win._current_tf()))
         # 模拟加载完成 → pending 补发
         win._loading = False
         win._fetch_seq += 1

@@ -5,6 +5,7 @@ import datetime
 import math
 import os
 import bisect
+import time
 from typing import Any
 
 from wkf.data.base import (
@@ -39,6 +40,22 @@ TICK_SIZE_MAP: dict[str, float] = {
     "ES1!": 0.25,
     "GC1!": 0.1,
 }
+
+# 旧别名 → MT5 真实品种（兼容历史 settings 记忆）
+ALIAS_TO_MT5: dict[str, str] = {
+    "GC1!": "XAUUSD",
+    "NQ1!": "USTECHc",
+    "ES1!": "US500c",
+}
+
+# 【改动点】V3.0：品种精简——只保留 黄金/纳指/标普500/白银/比特币。
+PREFERRED_SYMBOLS: list[str] = [
+    "XAUUSD",    # 黄金
+    "USTECHc",   # 纳指
+    "US500c",    # 标普500
+    "XAGUSD",    # 白银
+    "BTCUSDT",   # 比特币
+]
 
 # MT5 终端常见安装路径（默认 IPC 发现失败时显式重试，兼容非标准启动方式）
 MT5_TERMINAL_PATHS = [
@@ -90,17 +107,70 @@ def mt5_timeframe(timeframe: str) -> int:
 
 def resolve_mt5_symbol(symbol: str) -> str:
     """NQ1! -> USTECHc 等；未知原样返回（尝试直接拉取）。"""
-    return MT5_SYMBOL_MAP.get(symbol, symbol)
+    return MT5_SYMBOL_MAP.get(symbol, ALIAS_TO_MT5.get(symbol, symbol))
+
+
+_tick_size_cache: dict[str, tuple[float, float]] = {}
+TICK_SIZE_CACHE_TTL_S = 300
 
 
 def get_tick_size(symbol: str) -> float:
-    return TICK_SIZE_MAP.get(symbol, 0.25)
+    """返回品种价格最小变动单位：优先本地映射，其次动态查询 MT5，最后回退 0.25。
+
+    【改动点】V3.0：支持 MT5 全部品种——硬编码映射覆盖不到的品种
+    从终端 symbol_info().trade_tick_size 实时查询（带 5 分钟内存缓存，避免反复连接）。
+    """
+    if symbol in TICK_SIZE_MAP:
+        return TICK_SIZE_MAP[symbol]
+    hit = _tick_size_cache.get(symbol)
+    if hit and time.monotonic() - hit[1] < TICK_SIZE_CACHE_TTL_S:
+        return hit[0]
+    try:
+        import MetaTrader5 as mt5
+
+        if ensure_mt5_initialized(mt5):
+            try:
+                info = mt5.symbol_info(symbol)
+                ts = float(getattr(info, "trade_tick_size", 0) or 0)
+                if ts > 0:
+                    _tick_size_cache[symbol] = (ts, time.monotonic())
+                    return ts
+            finally:
+                mt5.shutdown()
+    except Exception:
+        pass
+    _tick_size_cache[symbol] = (0.25, time.monotonic())
+    return 0.25
+
+
+def get_mt5_symbols() -> list[str]:
+    """获取精简品种列表（黄金/纳指/标普500/白银/比特币）。
+
+    【改动点】V3.0：仅保留用户指定的 5 个品种（按顺序），
+    从终端 symbols_get() 校验存在性后返回，失败回退固定 5 品种。
+    """
+    try:
+        import MetaTrader5 as mt5
+
+        if ensure_mt5_initialized(mt5):
+            try:
+                syms = mt5.symbols_get()
+                available = {s.name for s in syms} if syms else set()
+                if available:
+                    picked = [s for s in PREFERRED_SYMBOLS if s in available]
+                    return picked or list(PREFERRED_SYMBOLS)
+            finally:
+                mt5.shutdown()
+    except Exception:
+        pass
+    return list(PREFERRED_SYMBOLS)
 
 
 def fetch_mt5_bars(
     symbol: str,
     timeframe: str = "15m",
     n_bars: int = 100,
+    close_confirm: bool = True,
 ) -> list[KlineBar]:
     """从 MT5 拉取 K 线，返回新→旧顺序的 KlineBar 列表。
 
@@ -109,6 +179,9 @@ def fetch_mt5_bars(
     与 GTC 服务器时区(约 GMT+11)错位 3 小时，导致返回的数据滞后约 3 小时
     （最新K线停在本地时间对应的服务器时段，错过真实最新行情）。
     copy_rates_from_pos 从最新 bar 开始往前取，无时区依赖，始终拿到实时数据。
+
+    close_confirm（收线确认）：True 时剔除当前未收盘的 K 线（开盘时间+周期 > 服务器时间），
+    保证分析与图表只使用已收盘定型的数据；False 时保留最新一根（含未收盘）。
     """
     import MetaTrader5 as mt5
 
@@ -120,6 +193,20 @@ def fetch_mt5_bars(
     rates = mt5.copy_rates_from_pos(mt5_sym, tf, 0, n_bars + 20)
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"MT5 无数据: {mt5_sym} ({timeframe})")
+
+    # 【改动点】V3.0 收线确认：剔除当前未收盘 bar（bar 开盘 + 周期 > 服务器时间）。
+    # MT5 周期常量即分钟数（M1=1, H1=60, D1=1440, W1=10080）。
+    if close_confirm:
+        try:
+            server_time = int(mt5.symbol_info(mt5_sym).time)
+            tf_seconds = int(tf) * 60
+            closed_rates = [
+                r for r in rates if int(r["time"]) + tf_seconds <= server_time
+            ]
+            if closed_rates:
+                rates = closed_rates
+        except Exception:
+            pass  # 时钟/信息异常时保持原样，不阻断取数
 
     bars: list[KlineBar] = []
     for r in rates:

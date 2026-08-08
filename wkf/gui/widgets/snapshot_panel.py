@@ -38,6 +38,12 @@ class SnapshotPanel(QWidget):
         self.text_view = QPlainTextEdit()
         self.text_view.setReadOnly(True)
         self.text_view.setMaximumBlockCount(2000)
+        # 【改动点】V3.0 修复：背景 #0f1b19（与上方K线图表一致）+ 浅灰白文字
+        self.text_view.setStyleSheet(
+            "QPlainTextEdit{background-color:#0f1b19;color:#d0d5db;"
+            "border:1px solid #2a3442;font-size:13px;"
+            "font-family:'Microsoft YaHei UI',Consolas,monospace;}"
+        )
         layout.addWidget(self.text_view)
         self.time_label = QLabel("快照生成时间：--")
         self.time_label.setStyleSheet("color:#8b949e;font-size:12px;")

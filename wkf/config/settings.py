@@ -28,11 +28,9 @@ class GeneralSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     analysis_bar_count: int = 48  # 图表默认时间级别 = 48小时窗口；此为根数下限
-    # 【改动点】默认品种 XAU/USD(GC1!)、默认周期 5 分钟（覆盖原 NQ1!/15m 默认）
-    # 【涉及文件】wkf/config/settings.py（对应 config_manager.py 默认配置）
-    # 【验证方式】首次启动品种=GC1!、周期=5分
-    last_symbol: str = "GC1!"
-    last_timeframe: str = "5m"
+    # 【改动点】V3.0：默认启动 BTC 1 分钟（比特币 1 分钟 K 线）
+    last_symbol: str = "BTCUSDT"
+    last_timeframe: str = "1m"
     # 【改动点】「品种-周期」独立记忆键值对：切换品种恢复该品种上次周期，
     #           切换周期立即写回；重启记忆不丢失。
     # 【涉及文件】wkf/config/settings.py
@@ -46,6 +44,14 @@ class GeneralSettings(BaseModel):
     # 【涉及文件】wkf/config/settings.py + wkf/data/datasource.py
     # 【验证方式】切到 yfinance 后 GUI 自动隐藏订单流面板并弹窗提示；mt5 恢复全部功能
     data_source: str = "mt5"
+    # 【改动点】V3.0：显示技术指标开关（默认 True；取消勾选 = 纯K线模式，
+    # 隐藏 EMA/布林带/VWAP/VA/POC/Delta/RSI，仅保留 K 线蜡烛与交互覆盖层）。
+    show_indicators: bool = True
+    # 【改动点】V3.0：收线确认——持续跟踪分析时等当前 K 线收盘定型后再分析，
+    # 且分析数据只使用已收盘 K 线（默认开启；关闭则包含未收盘的最新K线）。
+    close_confirm: bool = True
+    # 【改动点】V3.1：铃铛提示音开关（默认开启；分析完成播放简短提示音）
+    alert_enabled: bool = True
 
 
 class IndicatorSettings(BaseModel):

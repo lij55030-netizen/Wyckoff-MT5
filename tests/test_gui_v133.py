@@ -31,6 +31,7 @@ from wkf.gui.widgets.decision_panel import DecisionPanel  # noqa: E402
 from wkf.gui.widgets.diagnosis_panel import DiagnosisPanel  # noqa: E402
 from wkf.gui.widgets.history_panel import HistoryPanel  # noqa: E402
 from wkf.gui.widgets.snapshot_panel import SnapshotPanel  # noqa: E402
+from wkf.gui.chart_widget import WkfChart  # noqa: E402
 from wkf.wyckoff.analyzer import WyckoffAnalysis  # noqa: E402
 from wkf.wyckoff.background import BackgroundResult  # noqa: E402
 
@@ -103,6 +104,83 @@ class TestTimeStamps(unittest.TestCase):
         lines = text.splitlines()
         self.assertTrue(lines[0].startswith("🔍 诊断生成时间：2026-08-08 10:00:00"), lines[0])
         self.assertIn("MT5实盘数据源", lines[1])
+
+
+class TestIndicatorHide(unittest.TestCase):
+    """纯K线模式：隐藏 EMA/布林带/VWAP/VA/POC/Delta/RSI，仅保留蜡烛。"""
+
+    def test_settings_default_true(self) -> None:
+        from wkf.config.settings import GeneralSettings
+
+        self.assertTrue(GeneralSettings().show_indicators)
+
+    def test_indicator_dialog_has_switch(self) -> None:
+        from wkf.config.settings import load_settings
+        from wkf.gui.settings_dialogs import IndicatorDialog
+
+        s = load_settings()
+        dlg = IndicatorDialog(s)
+        self.assertTrue(hasattr(dlg, "_show_indicators"))
+        # 勾选状态应与当前配置一致（用户可能已自定义为纯K线）
+        self.assertEqual(
+            dlg._show_indicators.isChecked(), s.general.show_indicators
+        )
+
+    def test_pure_kline_hides_indicators(self) -> None:
+        frame = _mk_frame(n=6)
+        chart = WkfChart()
+        # 显示指标模式：蜡烛(2n) + EMA/BB×3/VWAP 指标线
+        chart.show_indicators = True
+        chart.set_frame(frame)
+        full_items = len(chart._items)
+        self.assertGreater(full_items, 2 * len(frame.bars), "显示模式应含指标层")
+        # 纯K线模式：仅蜡烛
+        chart.show_indicators = False
+        chart.set_frame(frame)
+        self.assertEqual(len(chart._items), 2 * len(frame.bars), "纯K线只保留蜡烛")
+        # RSI 副图已移除（V3.0），主图自动填满
+        self.assertFalse(hasattr(chart, "_rsi_plot"), "RSI 副图组件应已移除")
+
+
+class TestCrosshairMouseTracking(unittest.TestCase):
+    """十字光标修复：viewport 鼠标追踪开启 + 移动事件后价格标签可见。"""
+
+    def test_viewport_mouse_tracking_enabled(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        chart = WkfChart()
+        self.assertTrue(chart._plot.viewport().hasMouseTracking())
+        self.assertFalse(hasattr(chart, "_rsi_plot"), "RSI 副图组件应已移除")
+
+    def test_crosshair_label_shows_price_on_move(self) -> None:
+        """十字光标：十字线可见，数值标签显示光标位置价格。"""
+        from PyQt6.QtCore import QEvent, QPointF, Qt
+        from PyQt6.QtGui import QMouseEvent
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        chart = WkfChart()
+        chart.resize(900, 600)
+        chart.show()
+        app.processEvents()
+        chart.set_frame(_mk_frame(n=60))
+        chart.set_crosshair_enabled(True)
+
+        vp = chart._plot.viewport()
+        local = QPointF(vp.width() / 2, vp.height() / 2)
+        global_p = QPointF(vp.mapToGlobal(local.toPoint()))
+        ev = QMouseEvent(
+            QEvent.Type.MouseMove, local, global_p,
+            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        app.sendEvent(vp, ev)
+        app.processEvents()
+        self.assertTrue(chart._ch_vline.isVisible(), "十字线竖线应显示")
+        self.assertTrue(chart._ch_hline.isVisible(), "十字线横线应显示")
+        self.assertTrue(chart._ch_label.isVisible(), "十字光标价格标签应显示")
+        self.assertIn("价格", chart._ch_label.toPlainText())
 
 
 class TestDataSourceSwitch(unittest.TestCase):

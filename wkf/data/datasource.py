@@ -69,7 +69,13 @@ class MT5Source(DataSource):
         return True
 
     def available_symbols(self) -> list[str]:
-        return ["NQ1!", "ES1!", "GC1!"]
+        """动态返回 MT5 终端全部品种（失败回退默认三品种）。"""
+        try:
+            from wkf.data.mt5_source import get_mt5_symbols
+
+            return get_mt5_symbols()
+        except Exception:
+            return ["XAUUSD", "US500c", "USTECHc"]
 
 
 class YfinanceSource(DataSource):

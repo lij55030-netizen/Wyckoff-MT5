@@ -21,12 +21,16 @@ from wkf.wyckoff.analyzer import WyckoffAnalysis, analyze
 logger = logging.getLogger(__name__)
 
 
-def _fetch_bars_via_source(symbol: str, timeframe: str, bar_count: int, settings: Settings | None) -> list:
+def _fetch_bars_via_source(
+    symbol: str, timeframe: str, bar_count: int,
+    settings: Settings | None, close_confirm: bool | None = None,
+) -> list:
     """按数据源模式拉取 K 线（需求三：yfinance 可选数据源）。
 
     【改动点】取数统一走 wkf.data.datasource.get_data_source()：
       · data_source=mt5（默认）→ 走既有 fetch_mt5_bars（完整功能）；
       · data_source=yfinance → 走 YfinanceSource（无Tick，上层逻辑不变）。
+    【改动点】V3.0 收线确认：close_confirm=True 时 MT5 取数剔除未收盘 K 线。
     【涉及文件】wkf/orchestrator/runner.py + wkf/data/datasource.py
     【验证方式】data_source=mt5 行为与旧版完全一致（e2e 40/40）；
                 yfinance 模式返回的 KlineBar 列表结构一致。
@@ -38,8 +42,14 @@ def _fetch_bars_via_source(symbol: str, timeframe: str, bar_count: int, settings
         mode = settings.general.data_source if settings is not None else None
     except Exception:
         mode = None
+    if close_confirm is None:
+        close_confirm = True
+        try:
+            close_confirm = bool(settings.general.close_confirm)  # type: ignore[union-attr]
+        except Exception:
+            close_confirm = True
     if mode == DS_MT5 or mode is None:
-        return fetch_mt5_bars(symbol, timeframe, bar_count)
+        return fetch_mt5_bars(symbol, timeframe, bar_count, close_confirm=close_confirm)
     src = get_data_source(mode)
     return src.fetch_bars(symbol, timeframe, bar_count)
 
@@ -90,8 +100,15 @@ def run_analysis(
     bar_count: int = 100,
     settings: Settings | None = None,
     with_ai: bool = True,
+    progress_callback=None,
+    ai_stream_callback=None,
 ) -> AnalysisResult:
-    """完整分析管线。"""
+    """完整分析管线。
+
+    progress_callback: 可选进度回调（0~100 整数），阶段划分：
+      数据加载 0~25 → 快照生成 25~50 → AI诊断推理 50~80 → 决策组装 80~100。
+    ai_stream_callback: 可选 AI 流式回调 (reasoning, content)，边生成边输出。
+    """
     from wkf.config.settings import load_settings
 
     settings = settings or load_settings()
@@ -105,6 +122,8 @@ def run_analysis(
         if not bars:
             res.error = "数据源返回空 K 线数据"
             return res
+        if progress_callback:
+            progress_callback(25, "数据加载完成")
 
         # 2. 指标（参数来自设置，可配置）
         ind_cfg = settings.indicators
@@ -137,20 +156,39 @@ def run_analysis(
         )
         res.wyckoff = wa
         res.steps.append("威科夫三层分析(背景/价值区域/订单流验证)")
+        if progress_callback:
+            progress_callback(50, "快照生成")
 
         res.frame = frame
 
         # 5. AI 诊断（无 API Key 自动切换纯规则模式）
         if with_ai and settings.provider.api_key:
-            client = DeepSeekClient(settings.provider)
-            messages = build_stage1_messages(frame, wa)
-            reply = client.chat(messages, thinking=settings.provider.thinking)
-            res.ai_raw = reply.content
-            res.ai_reasoning = reply.reasoning_content
-            res.ai_diagnosis = extract_json(reply.content)
-            res.usage = reply.usage
-            res.latency_ms = reply.latency_ms
-            res.steps.append("AI 增强诊断")
+            if progress_callback:
+                progress_callback(55, "AI诊断推理中")
+            try:
+                client = DeepSeekClient(settings.provider)
+                messages = build_stage1_messages(frame, wa)
+                reply = client.chat(
+                    messages,
+                    thinking=settings.provider.thinking,
+                    stream_callback=ai_stream_callback,
+                )
+                res.ai_raw = reply.content
+                res.ai_reasoning = reply.reasoning_content
+                res.ai_diagnosis = extract_json(reply.content)
+                res.usage = reply.usage
+                res.latency_ms = reply.latency_ms
+                res.steps.append("AI 增强诊断")
+                if progress_callback:
+                    progress_callback(80, "AI诊断完成")
+            except Exception as ai_exc:  # noqa: BLE001
+                # 【改动点】V3.0：AI 调用失败不整体失败——降级为纯规则模式，
+                # 保留威科夫三层结果（此前异常被外层 except 捕获导致整单失败）。
+                logger.warning("AI 诊断失败，降级纯规则模式: %s", ai_exc)
+                res.ai_diagnosis = None
+                res.steps.append(f"AI 诊断失败，降级纯规则模式（{str(ai_exc)[:60]}）")
+                if progress_callback:
+                    progress_callback(80, "AI诊断降级")
         elif with_ai and not settings.provider.api_key:
             res.steps.append("AI 诊断(纯规则模式：未配置 API Key)")
         elif not with_ai:
@@ -276,9 +314,11 @@ def get_latest_bar_ts(symbol: str, timeframe: str) -> int:
     """获取最新已收盘 K 线的 ts_open（用于检测新 K 线收盘）。
 
     返回 -1 表示获取失败。
+    注意：此处 close_confirm=False 保留最新（可能未收盘）K 线，
+    供 K 线倒计时与「新 K 线开始」检测使用；分析取数才按收线确认剔除。
     """
     try:
-        bars = _fetch_bars_via_source(symbol, timeframe, 2, None)
+        bars = _fetch_bars_via_source(symbol, timeframe, 2, None, close_confirm=False)
         if bars:
             return bars[0].ts_open
         return -1

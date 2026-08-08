@@ -82,9 +82,8 @@ def fetch_ticks_for_range(
     """从 MT5 拉取 CFD tick 并分类。mt5 需已初始化。"""
     import MetaTrader5 as mt5
 
-    mt5_sym = MT5_TICK_MAP.get(symbol)
-    if mt5_sym is None:
-        return None
+    # 【改动点】V3.0：支持 MT5 全部品种——映射表覆盖不到的品种直接用原名拉取。
+    mt5_sym = MT5_TICK_MAP.get(symbol, symbol)
 
     ticks_raw = mt5.copy_ticks_range(mt5_sym, dt_from, dt_to, mt5.COPY_TICKS_ALL)
     if ticks_raw is None or len(ticks_raw) == 0:
