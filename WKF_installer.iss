@@ -1,11 +1,11 @@
 ; ============================================================
-; WKF 威科夫交易智能体 V3.0 — 一键安装包脚本（onedir 目录分发）
+; WKF 威科夫交易智能体 V3.1 — 一键安装包脚本（onedir 目录分发）
 ; 编译: ISCC.exe WKF_installer.iss
-; 产物: installer\WKF_V3.0_Setup.exe
+; 产物: installer\WKF_V3.1_Setup.exe
 ; 支持: 自定义安装路径 / 桌面快捷方式(可选) / 开始菜单 / 内置卸载程序
 ; ============================================================
 #define MyAppName "WKF 威科夫交易智能体"
-#define MyAppVersion "3.0.0"
+#define MyAppVersion "3.1.0"
 #define MyAppExeName "WKF.exe"
 
 [Setup]
@@ -21,7 +21,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 OutputDir=installer
-OutputBaseFilename=WKF_V3.0_Setup
+OutputBaseFilename=WKF_V3.1_Setup
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
