@@ -22,7 +22,17 @@ if not TOKEN:
     print("❌ 未设置 GITHUB_TOKEN 环境变量（python tools/create_release.py 前先 set）")
     raise SystemExit(1)
 
-BODY = """## WKF V3.0 One-Click Install Release
+BODY = """## 🎉 WKF 威科夫交易智能体 V3.0 一键安装版发布
+
+### 📦 下载指引（点击文件名即可下载，说明如下）
+
+| 点击下载 | 这是什么 | 怎么用 |
+|---|---|---|
+| **WKF_V3.0_Setup.exe** | 一键安装包（推荐） | 双击运行进入安装向导，支持自定义安装路径、桌面快捷方式、开始菜单、卸载程序 |
+| **WKF_V3.0_Portable.zip** | 绿色免安装版 | 解压后双击文件夹里的 `WKF.exe` 即可使用，无需安装、无需 Python 环境 |
+| **WKF_V3.0_Readme.txt** | 使用说明 | 下载后请先阅读：MT5 连接、数据源切换、功能简介 |
+
+> 提示：如浏览器下载后文件名显示异常，可右键另存为后重命名。
 
 ### 🎉 本版亮点（V1.3.2 + V1.3.3 迭代汇总）
 
@@ -70,7 +80,7 @@ def api(method, url, data=None):
 try:
     rel = api("POST", f"{BASE}/releases", {
         "tag_name": "v3.0",
-        "name": "V3.0 One-Click Install Release",
+        "name": "WKF 威科夫交易智能体 V3.0 一键安装版",
         "body": BODY,
         "draft": False,
         "prerelease": False,
@@ -83,20 +93,43 @@ except Exception as e:
         print("❌ 创建失败:", str(e)[:200])
         raise SystemExit(1)
     print("ℹ️ Release 已存在，复用:", rel["html_url"])
+    # 已存在则同步更新标题与说明（汉化）
+    try:
+        rel = api("PATCH", f"{BASE}/releases/{rel['id']}", {
+            "name": "WKF 威科夫交易智能体 V3.0 一键安装版",
+            "body": BODY,
+        })
+        print("✅ Release 标题与说明已更新为中文")
+    except Exception as e:
+        print(f"⚠️ 更新标题失败: {str(e)[:120]}")
 
-# 2. 上传资产
+# 2. 上传资产（本地路径, 上传显示名, 内容类型）
+# 说明：当前网络通道对非 ASCII 文件名会归一化为 default.txt，
+# 资产名保持 ASCII 语义（Setup/Portable/Readme），中文说明在 Release 正文。
 assets = [
-    ("installer/WKF_V3.0_Setup.exe", "application/octet-stream"),
-    ("installer/WKF_V3.0_绿色免安装版.zip", "application/zip"),
-    ("绿色免安装版说明.txt", "text/plain; charset=utf-8"),
+    ("installer/WKF_V3.0_Setup.exe", "WKF_V3.0_Setup.exe", "application/octet-stream"),
+    ("installer/WKF_V3.0_绿色免安装版.zip", "WKF_V3.0_Portable.zip", "application/zip"),
+    ("绿色免安装版说明.txt", "WKF_V3.0_Readme.txt", "text/plain; charset=utf-8"),
 ]
 rel_id = rel["id"]
-for path, ctype in assets:
+
+# 2.1 清理同 Release 下所有旧资产（含 default.txt / 截断名等垃圾）
+for asset in rel.get("assets", []):
+    old = asset["name"]
+    del_url = f"{BASE}/releases/assets/{asset['id']}"
+    del_req = urllib.request.Request(del_url, headers=HDR, method="DELETE")
+    try:
+        with urllib.request.urlopen(del_req, timeout=60):
+            print(f"🗑️ 已删除旧资产: {old}")
+    except Exception as e:
+        print(f"⚠️ 删除旧资产失败 {old}: {str(e)[:120]}")
+
+# 2.2 上传中文名资产
+for path, name, ctype in assets:
     if not os.path.exists(path):
         print(f"⚠️ 资产缺失，跳过: {path}")
         continue
-    name = os.path.basename(path)
-    url = f"{UPLOAD_BASE}/releases/{rel_id}/assets?name={urllib.parse.quote(name)}"
+    url = f"{UPLOAD_BASE}/releases/{rel_id}/assets?name={urllib.parse.quote(name, safe='')}"
     with open(path, "rb") as f:
         data = f.read()
     req = urllib.request.Request(url, data=data, headers={**HDR, "Content-Type": ctype}, method="POST")
